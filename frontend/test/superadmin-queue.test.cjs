@@ -20,7 +20,8 @@ before(async () => {
 function patient(id, service = "consultation", score = 1, created = "2026-10-10T01:00:00Z") {
   return { id, id_num: `Test patient ${id}`, queue_number: `TEST-${id}`, service_type: service,
     status: "waiting", priority_score: score, created_at: created,
-    counter_id: null, called_at: null, completed_at: null, awaiting_accept: false, vulnerability_flags: [] };
+    counter_id: null, called_at: null, accepted_at: null, consultation_started_at: null,
+    completed_at: null, awaiting_accept: false, vulnerability_flags: [] };
 }
 function doctor(number, state = {}) {
   return { id: number, id_num: `Doctor ${number}`, is_online: true, current_patient_id: null, ...state };
@@ -213,39 +214,46 @@ test("Superadmin displays API errors, refreshes authoritative state, and release
   assert.equal(callButton(h.render(), 1).props.disabled, false);
 });
 
-test("Superadmin waiting-for-acceptance patient cannot be completed before the existing doctor acceptance", async () => {
-  const h = await harness([serving(1, { awaiting_accept: true })], { counters: [doctor(1, { current_patient_id: 1 }), doctor(2), doctor(3)] });
-  const complete = buttons(row(h.render(), 1), "Complete")[0];
-  assert.equal(complete.props.disabled, true);
-  await complete.props.onClick();
-  assert.equal(h.actions.length, 0);
-  assert.equal(h.rows[0].status, "serving");
-  assert.equal(h.rows[0].completed_at, null);
+test("Superadmin monitors called, accepted and started phases without consultation completion controls", async () => {
+  for (const [phase, label] of [
+    [{ awaiting_accept: true }, "Awaiting doctor acceptance"],
+    [{ awaiting_accept: false, accepted_at: "2026-10-10T01:02:00Z" }, "Ready for consultation"],
+    [{ awaiting_accept: false, accepted_at: "2026-10-10T01:02:00Z", consultation_started_at: "2026-10-10T01:03:00Z" }, "Consultation in progress"]
+  ]) {
+    const h = await harness([serving(1, phase)], { counters: [doctor(1, { current_patient_id: 1 }), doctor(2), doctor(3)] });
+    const patientRow = row(h.render(), 1);
+    assert.ok(text(patientRow).includes(label));
+    for (const action of ["Call", "Accept", "Start Consultation", "Complete", "Complete Consultation"])
+      assert.equal(buttons(patientRow, action).length, 0);
+    assert.equal(buttons(patientRow, "Cancel").length, 1);
+    assert.equal(h.actions.length, 0);
+    assert.equal(h.rows[0].status, "serving");
+    assert.equal(h.rows[0].completed_at, null);
+  }
 });
 
-test("Superadmin Complete and Cancel wait for server state and do not invent completion timestamps", async () => {
-  for (const [label, route] of [["Complete", "/queue/complete"], ["Cancel", "/queue/cancel"]]) {
+test("Superadmin Cancel waits for server state before and during consultation without inventing timestamps", async () => {
+  for (const consultation_started_at of [null, "2026-10-10T01:03:00Z"]) {
     let finish;
-    const h = await harness([serving(1)], {
+    const h = await harness([serving(1, { accepted_at: "2026-10-10T01:02:00Z", consultation_started_at })], {
       counters: [doctor(1, { current_patient_id: 1 }), doctor(2), doctor(3)],
       request: () => new Promise(resolve => { finish = resolve; })
     });
     const before = h.rows;
-    const pending = buttons(row(h.render(), 1), label)[0].props.onClick();
-    assert.deepEqual(h.actions, [{ route, method: "POST", body: label === "Cancel"
-      ? { patient_id: 1, reason: "Test cancellation reason", counter_id: "Doctor 1" }
-      : { patient_id: 1 } }]);
-    assert.deepEqual(h.rows, before, `${label} must preserve state while pending`);
-    finish({ error: `${label} rejected by server` });
+    const pending = buttons(row(h.render(), 1), "Cancel")[0].props.onClick();
+    assert.deepEqual(h.actions, [{ route: "/queue/cancel", method: "POST", body:
+      { patient_id: 1, reason: "Test cancellation reason", counter_id: "Doctor 1" } }]);
+    assert.deepEqual(h.rows, before, "Cancel must preserve state while pending");
+    finish({ error: "Cancel rejected by server" });
     await pending;
     await h.flush();
     assert.deepEqual(h.rows, before);
-    assert.match(text(h.render()), new RegExp(`${label} rejected by server`));
+    assert.match(text(h.render()), /Cancel rejected by server/);
     assert.equal(h.refreshes, 1);
   }
 });
 
-test("Superadmin Undo preserves the completed record until the backend refresh confirms the transition", async () => {
+test("Superadmin legacy completed-record Undo preserves history until the backend refresh confirms the transition", async () => {
   let finish;
   const completed = { ...serving(1), status: "completed", completed_at: "2026-10-10T01:10:00Z" };
   const h = await harness([completed], { request: () => new Promise(resolve => { finish = resolve; }) });
@@ -260,6 +268,24 @@ test("Superadmin Undo preserves the completed record until the backend refresh c
   assert.deepEqual(h.rows, before);
   assert.match(text(h.render()), /Undo rejected by server/);
   assert.equal(h.refreshes, 1);
+});
+
+test("Superadmin retains genuine completed consultation history without Undo or Re-queue actions", async () => {
+  const completed = { ...serving(1), status: "completed", accepted_at: "2026-10-10T01:02:00Z",
+    consultation_started_at: "2026-10-10T01:03:00Z", completed_at: "2026-10-10T01:10:00Z", service_duration_seconds: 420 };
+  const h = await harness([completed]);
+  const patientRow = row(h.render(), 1);
+  assert.ok(patientRow, "completed consultation remains visible in history-enabled monitoring");
+  assert.match(text(patientRow), /completed/);
+  assert.equal(nodes(patientRow, node => node.type === "button" && node.props.title === "More actions").length, 0);
+  for (const action of ["Undo", "Re-queue", "Complete", "Complete Consultation"])
+    assert.equal(buttons(patientRow, action).length, 0);
+  assert.deepEqual(h.rows, [completed]);
+  assert.equal(h.actions.length, 0);
+
+  const activeOnly = await harness([completed], { settings: { showCompleted: false } });
+  assert.equal(row(activeOnly.render(), 1), undefined, "existing monitoring history filter still hides completed records");
+  assert.deepEqual(activeOnly.rows, [completed], "filtering must not delete completed history");
 });
 
 test("Superadmin Cancel requires a nonempty reason and a dismissed prompt leaves the patient untouched", async () => {

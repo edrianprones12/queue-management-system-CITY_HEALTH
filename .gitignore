@@ -2,6 +2,8 @@ backend/.env
 frontend/.env
 *.local.php
 node_modules/
+.venv-voice/
+__pycache__/
 frontend/.next/
 backend/data/awaiting-accept.json
 backend/data/voice-announcements.json

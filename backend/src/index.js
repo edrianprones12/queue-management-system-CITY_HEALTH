@@ -53,7 +53,12 @@ app.use((error, _req, res, _next) => {
   });
 });
 
-app.listen(env.port, "0.0.0.0", async () => {
+app.listen(env.port, "0.0.0.0", async (error) => {
+  if (error) {
+    console.error(`Queue backend could not listen on port ${env.port}: ${error.code || error.message}`);
+    process.exitCode = 1;
+    return;
+  }
   console.log(`Queue backend listening on http://0.0.0.0:${env.port}`);
   try {
     await seedCounters();

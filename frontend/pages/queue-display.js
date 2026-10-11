@@ -39,6 +39,57 @@ function soundNotificationsAllowed() {
   return runtimeQueueSettings?.soundNotifications !== false;
 }
 
+function playCabinChime(ctx) {
+  // A locked browser must not delay the separate Python voice announcer.
+  if (ctx.state !== "running") return Promise.resolve();
+
+  return new Promise((resolve) => {
+    const nodes = [];
+    let fallbackTimer;
+    const finish = () => {
+      clearTimeout(fallbackTimer);
+      for (const { osc, gain } of nodes) {
+        osc.onended = null;
+        try { osc.stop(); } catch (_e) { /* already stopped */ }
+        osc.disconnect();
+        gain.disconnect();
+      }
+      resolve();
+    };
+
+    try {
+      const start = ctx.currentTime + 0.02;
+      const noteDuration = 1.2;
+      const noteSpacing = 0.8;
+      // Balance the higher ding and lower dong with separate volume levels.
+      const notes = [
+        { frequency: 880, peakGain: 0.20 },
+        { frequency: 660, peakGain: 0.24 }
+      ];
+      notes.forEach(({ frequency, peakGain }, index) => {
+        const at = start + index * noteSpacing;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        nodes.push({ osc, gain });
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(frequency, at);
+        gain.gain.setValueAtTime(0, at);
+        gain.gain.linearRampToValueAtTime(peakGain, at + 0.015);
+        gain.gain.exponentialRampToValueAtTime(peakGain * 0.0005, at + noteDuration - 0.02);
+        gain.gain.linearRampToValueAtTime(0, at + noteDuration);
+        osc.connect(gain).connect(ctx.destination);
+        if (index === notes.length - 1) osc.onended = finish;
+        osc.start(at);
+        osc.stop(at + noteDuration);
+      });
+      // Cancel any remaining sound if the context stalls during playback.
+      fallbackTimer = setTimeout(finish, (0.02 + noteSpacing + noteDuration) * 1000 + 300);
+    } catch (_e) {
+      finish();
+    }
+  });
+}
+
 function formatQueueForSpeech(queueNumber) {
   return String(queueNumber || "")
     .replace(/-/g, "")
@@ -198,7 +249,7 @@ export default function QueueDisplayPage() {
   function unlockAudioFromUserGesture() {
     if (typeof window === "undefined") return;
 
-    // Unlock Web Audio (bell) inside the click gesture with an audible chime
+    // Resume inside the click gesture; the chime plays with the next announcement.
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (Ctx) {
@@ -206,24 +257,13 @@ export default function QueueDisplayPage() {
         if (audioCtxRef.current.state === "suspended") {
           audioCtxRef.current.resume().catch(() => {});
         }
-        const ctx = audioCtxRef.current;
-        const now = ctx.currentTime;
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.setValueAtTime(880, now);
-        gain.gain.setValueAtTime(0.35, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.35);
-        osc.connect(gain).connect(ctx.destination);
-        osc.start(now);
-        osc.stop(now + 0.35);
       }
     } catch (_e) {
       // ignore
     }
 
     // Voice itself is handled by the local pyttsx3 service. The browser only
-    // plays the optional bell, so SpeechSynthesis never overlaps with pyttsx3.
+    // plays the optional cabin chime, so SpeechSynthesis never overlaps with pyttsx3.
   }
 
   async function checkPyttsx3Service({ initialize = false } = {}) {
@@ -262,6 +302,7 @@ export default function QueueDisplayPage() {
       setVoiceStatus("Voice announcements are disabled in System Settings.");
       return;
     }
+    unlockAudioFromUserGesture();
     setVoiceStatus("Checking local pyttsx3 service...");
     try {
       await checkPyttsx3Service({ initialize: true });
@@ -274,7 +315,6 @@ export default function QueueDisplayPage() {
     if (!seededRef.current) {
       seedKnownCalls(displayRef.current);
     }
-    unlockAudioFromUserGesture();
     voiceEnabledRef.current = true;
     setVoiceEnabled(true);
     setVoiceStatus("Listening for doctor calls via pyttsx3...");
@@ -427,52 +467,15 @@ export default function QueueDisplayPage() {
   }
 
   function playNotificationBell() {
-    return new Promise((resolve) => {
-      if (!soundNotificationsAllowed()) {
-        resolve();
-        return;
-      }
-      try {
-        const Ctx = window.AudioContext || window.webkitAudioContext;
-        if (!Ctx) {
-          resolve();
-          return;
-        }
-        if (!audioCtxRef.current) audioCtxRef.current = new Ctx();
-        const ctx = audioCtxRef.current;
-        if (ctx.state === "suspended") {
-          ctx.resume().catch(() => {});
-        }
-        const now = ctx.currentTime;
-
-        const osc1 = ctx.createOscillator();
-        const gain1 = ctx.createGain();
-        osc1.type = "sine";
-        osc1.frequency.setValueAtTime(880, now);
-        osc1.frequency.setValueAtTime(1100, now + 0.12);
-        gain1.gain.setValueAtTime(0.5, now);
-        gain1.gain.exponentialRampToValueAtTime(0.01, now + 0.4);
-        osc1.connect(gain1).connect(ctx.destination);
-        osc1.start(now);
-        osc1.stop(now + 0.4);
-
-        const osc2 = ctx.createOscillator();
-        const gain2 = ctx.createGain();
-        osc2.type = "sine";
-        osc2.frequency.setValueAtTime(660, now + 0.25);
-        osc2.frequency.setValueAtTime(880, now + 0.37);
-        gain2.gain.setValueAtTime(0, now);
-        gain2.gain.setValueAtTime(0.5, now + 0.25);
-        gain2.gain.exponentialRampToValueAtTime(0.01, now + 0.65);
-        osc2.connect(gain2).connect(ctx.destination);
-        osc2.start(now + 0.25);
-        osc2.stop(now + 0.65);
-
-        setTimeout(resolve, 700);
-      } catch (e) {
-        resolve();
-      }
-    });
+    if (!soundNotificationsAllowed() || typeof window === "undefined") return Promise.resolve();
+    try {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return Promise.resolve();
+      if (!audioCtxRef.current) audioCtxRef.current = new Ctx();
+      return playCabinChime(audioCtxRef.current);
+    } catch (_e) {
+      return Promise.resolve();
+    }
   }
 
   function sendPyttsx3Announcement(payload) {

@@ -409,10 +409,8 @@ export default function HomePage() {
       }
       body.counterId = mappedDoctor;
     }
-    if (path === "/queue/complete" &&
-        (patient.status !== "serving" || !patient.counter_id || !patient.called_at || patient.awaiting_accept ||
-          inconsistentServing.some((row) => row.id === patientId))) {
-      setError("The assigned doctor must accept this serving patient before completion.");
+    if (path === "/queue/complete") {
+      setError("The assigned doctor must start and complete the consultation in the Doctor Dashboard.");
       return;
     }
     if (path === "/queue/cancel") {
@@ -1155,6 +1153,7 @@ export default function HomePage() {
                             <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${statusClass}`}>{patient.status}</span>
                             {patient.status === "serving" && !validServing && <div className="mt-1 text-[10px] text-amber-800">Doctor assignment missing or inconsistent</div>}
                             {patient.status === "serving" && validServing && patient.awaiting_accept && <div className="mt-1 text-[10px] brand-text-muted">Awaiting doctor acceptance</div>}
+                            {patient.status === "serving" && validServing && !patient.awaiting_accept && <div className="mt-1 text-[10px] brand-text-muted">{patient.consultation_started_at ? "Consultation in progress" : "Ready for consultation"}</div>}
                           </td>
                           <td className="px-2 py-2 text-xs brand-text-muted whitespace-nowrap">{new Date(patient.created_at).toLocaleTimeString()}</td>
                           <td className="px-2 py-2">
@@ -1165,12 +1164,6 @@ export default function HomePage() {
                                   {pendingActions.has(patient.id) ? "Calling..." : "Call"}
                                 </button>
                               ) : null}
-                              {patient.status === "serving" ? (
-                                <button type="button" onClick={() => queueAction("/queue/complete", patient.id)} disabled={actionPending || !validServing || patient.awaiting_accept} className="brand-button px-2 py-1 rounded text-xs whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed">
-                                  <i className="fas fa-check mr-0.5" />
-                                  Complete
-                                </button>
-                              ) : null}
                               {!["completed", "cancelled"].includes(patient.status) ? (
                                 <button type="button" onClick={() => queueAction("/queue/cancel", patient.id)} disabled={actionPending} className="bg-red-600 text-white px-2 py-1 rounded text-xs hover:bg-red-700 whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed">
                                   <i className="fas fa-times mr-0.5" />
@@ -1178,7 +1171,7 @@ export default function HomePage() {
                                 </button>
                               ) : null}
 
-                              {patient.id === lastActionId && (
+                              {patient.id === lastActionId && !(patient.status === "completed" && patient.consultation_started_at) && (
                                 <div className="flex items-center gap-2 action-menu-container">
                                   <button
                                     type="button"

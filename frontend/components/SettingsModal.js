@@ -337,7 +337,7 @@ export default function SettingsModal({
               <h4 className="font-bold brand-text text-base m-0 pb-2 border-b brand-border">
                 Notification and Announcement Settings
               </h4>
-              <SettingRow title="Sound Notifications" description="Play alert sounds for queue events where supported.">
+              <SettingRow title="Sound Notifications" description="Play a soft cabin chime before public display voice announcements.">
                 <button type="button" onClick={() => updateDraft({ soundNotifications: !draft.soundNotifications })}>
                   <ToggleBadge enabled={!!draft.soundNotifications} />
                 </button>

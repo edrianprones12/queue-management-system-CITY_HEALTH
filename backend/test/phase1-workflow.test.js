@@ -2,7 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createHarness, createDatabase } = require("./helpers/queueHarness");
 
-const doctorUser = (name) => ({ id_num: "admin", role: "admin", doctor_name: name });
+const doctorUser = (name) => ({ id_num: `admin${name.replace("Doctor ", "")}`, role: "admin", doctor_name: name });
 const registration = (name, service = "consultation", flags = []) => ({
   idNum: name, serviceType: service, vulnerabilityFlags: flags,
   mobileNumber: "09123456789", residency: "Cabadbaran", philhealthId: "YAKAP-123",
@@ -15,6 +15,13 @@ async function setup(localFallback = false) {
   return harness;
 }
 
+async function completeConsultation(h, patientId, reason = null) {
+  const doctor = doctorUser("Doctor 1");
+  await h.service.startConsultation(patientId, doctor);
+  h.advance();
+  return h.service.completePatient(patientId, reason, "Doctor 1", doctor);
+}
+
 for (const localFallback of [false, true]) {
   const mode = localFallback ? "local fallback" : "mock Supabase";
 
@@ -25,7 +32,7 @@ for (const localFallback of [false, true]) {
       assert.match(patient.queue_number, new RegExp(`^${prefix}-\\d{3}$`));
       assert.equal(patient.priority_score, 7);
       assert.equal(patient.status, "waiting");
-      for (const field of ["counter_id", "called_at", "completed_at"]) assert.equal(patient[field], null);
+      for (const field of ["counter_id", "called_at", "completed_at", "consultation_started_at"]) assert.equal(patient[field], null);
       assert.equal(patient.philhealth_id, "YAKAP-123");
       assert.equal(patient.residency, "Cabadbaran");
       assert.equal(patient.birthdate, "1990-04-12");
@@ -122,7 +129,7 @@ for (const localFallback of [false, true]) {
     assert.equal((await h.service.getPatientById(laboratory.id)).counter_id, "Doctor 1");
     assert.equal((await h.service.getPatientById(laboratory.id)).status, "serving");
     assert.equal((await h.request("POST", "/queue/accept", { patient_id: laboratory.id }, doctorUser("Doctor 1"))).status, 200);
-    await h.service.completePatient(laboratory.id);
+    await completeConsultation(h, laboratory.id);
     await h.service.callPatient(dental.id);
     assert.equal((await h.service.getPatientById(dental.id)).counter_id, "Doctor 1");
     assert.equal((await h.service.getPatientById(dental.id)).status, "serving");
@@ -147,7 +154,7 @@ for (const localFallback of [false, true]) {
     assert.equal((await h.service.getPatientById(second.id)).status, "waiting");
     assert.equal(h.settings.isAwaitingAccept(second.id), false);
     assert.equal((await h.request("POST", "/queue/accept", { patient_id: first.id }, doctorUser("Doctor 1"))).status, 200);
-    await h.service.completePatient(first.id);
+    await completeConsultation(h, first.id);
     await assert.rejects(h.service.callPatient(first.id, "Doctor 1"), /waiting/i);
     assert.ok((await h.service.getPatientById(first.id)).completed_at);
   });
@@ -185,20 +192,69 @@ for (const localFallback of [false, true]) {
     assert.equal((await h.service.getDisplayData()).all_serving.length, 3);
   });
 
+  test(`${mode}: the legacy Front Desk account label can call each service's assigned doctor`, async () => {
+    for (const label of ["Front Desk", " front desk ", "FRONTDESK"]) {
+      const h = await setup(localFallback);
+      const frontdesk = { id_num: "frontdesk", role: "admin", doctor_name: label };
+      for (const [index, service] of ["consultation", "prenatal", "family_planning"].entries()) {
+        const patient = await h.service.createQueueEntry(registration(`${label} patient ${index + 1}`, service));
+        const doctor = `Doctor ${index + 1}`;
+        const field = index % 2 === 0 ? "counterId" : "counter_id";
+        const response = await h.request("POST", "/queue/call", { patient_id: patient.id, [field]: doctor }, frontdesk);
+        assert.equal(response.status, 200, response.body.message);
+        const current = await h.service.getPatientById(patient.id);
+        assert.equal(current.status, "serving");
+        assert.equal(current.counter_id, doctor);
+        assert.ok(current.called_at);
+        assert.equal(current.consultation_started_at, null);
+        assert.equal(current.completed_at, null);
+        assert.equal(h.settings.isAwaitingAccept(patient.id), true);
+        const counters = (await h.service.getQueueOverview()).counters;
+        assert.equal(counters[index].current_patient_id, patient.id);
+      }
+      assert.equal(h.settings.getVoiceAnnouncementEvents().length, 0, "Frontdesk calling still waits for doctor acceptance before announcing");
+    }
+  });
+
+  test(`${mode}: Front Desk label handling preserves conflicting payload and Doctor 1 ownership restrictions`, async () => {
+    const h = await setup(localFallback);
+    const patient = await h.service.createQueueEntry(registration("Doctor 2 ownership", "prenatal"));
+    const frontdesk = { id_num: "frontdesk", role: "admin", doctor_name: "Front Desk" };
+    const conflicting = await h.request("POST", "/queue/call", {
+      patient_id: patient.id, counterId: "Doctor 2", counter_id: "Doctor 3"
+    }, frontdesk);
+    assert.equal(conflicting.status, 400);
+    assert.match(conflicting.body.message, /Conflicting doctor assignments/);
+    const wrongDoctor = await h.request("POST", "/queue/call", {
+      patient_id: patient.id, counterId: "Doctor 2"
+    }, doctorUser("Doctor 1"));
+    assert.equal(wrongDoctor.status, 403);
+    const omittedCounter = await h.request("POST", "/queue/call", {
+      patient_id: patient.id
+    }, doctorUser("Doctor 1"));
+    assert.equal(omittedCounter.status, 400);
+    const current = await h.service.getPatientById(patient.id);
+    assert.equal(current.status, "waiting");
+    assert.equal(current.called_at, null);
+    assert.equal(current.counter_id, null);
+    assert.equal(h.settings.isAwaitingAccept(patient.id), false);
+    assert.ok((await h.service.getQueueOverview()).counters.every((counter) => counter.current_patient_id === null));
+  });
+
   test(`${mode}: Superadmin cannot complete a waiting patient or bypass doctor acceptance`, async () => {
     const h = await setup(localFallback);
     const superadmin = { id_num: "superadmin", role: "superadmin", doctor_name: null };
     const patient = await h.service.createQueueEntry(registration("Awaiting doctor acceptance"));
     let response = await h.request("POST", "/queue/complete", { patient_id: patient.id }, superadmin);
-    assert.equal(response.status, 400);
+    assert.equal(response.status, 403);
     assert.equal((await h.service.getPatientById(patient.id)).status, "waiting");
     assert.equal((await h.service.getPatientById(patient.id)).completed_at, null);
 
     assert.equal((await h.request("POST", "/queue/call", { patient_id: patient.id, counterId: "Doctor 1" }, superadmin)).status, 200);
     const calledAt = (await h.service.getPatientById(patient.id)).called_at;
     response = await h.request("POST", "/queue/complete", { patient_id: patient.id }, superadmin);
-    assert.equal(response.status, 400);
-    assert.match(response.body.message, /Accept this patient/i);
+    assert.equal(response.status, 403);
+    assert.match(response.body.message, /doctor|authorized/i);
     const current = await h.service.getPatientById(patient.id);
     assert.equal(current.status, "serving");
     assert.equal(current.called_at, calledAt);
@@ -210,7 +266,7 @@ for (const localFallback of [false, true]) {
     assert.equal((await h.service.getDisplayData()).recent_accepted.length, 0);
   });
 
-  test(`${mode}: Superadmin completion follows acceptance and rejects duplicate completion without changing records`, async () => {
+  test(`${mode}: Superadmin cannot finish consultations; assigned doctor completion rejects duplicates without changing records`, async () => {
     const h = await setup(localFallback);
     const superadmin = { id_num: "superadmin", role: "superadmin", doctor_name: null };
     const patient = await h.service.createQueueEntry(registration("Accepted completion"));
@@ -218,14 +274,17 @@ for (const localFallback of [false, true]) {
     assert.equal((await h.request("POST", "/queue/accept", { patient_id: patient.id }, doctorUser("Doctor 1"))).status, 200);
     const acceptedAt = h.settings.getAcceptedAt(patient.id);
     h.advance();
-    const first = await h.request("POST", "/queue/complete", { patient_id: patient.id, reason: "Consultation finished" }, superadmin);
+    assert.equal((await h.request("POST", "/queue/complete", { patient_id: patient.id }, superadmin)).status, 403);
+    assert.equal((await h.request("POST", "/queue/start", { patient_id: patient.id }, doctorUser("Doctor 1"))).status, 200);
+    h.advance();
+    const first = await h.request("POST", "/queue/complete", { patient_id: patient.id, reason: "Consultation finished" }, doctorUser("Doctor 1"));
     assert.equal(first.status, 200);
     const completed = JSON.parse(JSON.stringify(await h.service.getPatientById(patient.id)));
     assert.equal(completed.status, "completed");
     assert.ok(completed.completed_at);
     assert.equal((await h.service.getQueueOverview()).counters[0].current_patient_id, null);
     h.advance();
-    const duplicate = await h.request("POST", "/queue/complete", { patient_id: patient.id, reason: "Duplicate attempt" }, superadmin);
+    const duplicate = await h.request("POST", "/queue/complete", { patient_id: patient.id, reason: "Duplicate attempt" }, doctorUser("Doctor 1"));
     assert.equal(duplicate.status, 400);
     assert.deepEqual(JSON.parse(JSON.stringify(await h.service.getPatientById(patient.id))), completed);
     assert.equal(h.settings.getAcceptedAt(patient.id), acceptedAt, "Existing accepted announcement event is preserved");
@@ -240,8 +299,8 @@ for (const localFallback of [false, true]) {
     for (const incomplete of [{ counter_id: null, called_at: calledAt }, { counter_id: "Doctor 1", called_at: null }]) {
       Object.assign(stored, incomplete);
       const before = JSON.parse(JSON.stringify(stored));
-      const response = await h.request("POST", "/queue/complete", { patient_id: patient.id, counterId: "Doctor 1" }, { id_num: "superadmin", role: "superadmin", doctor_name: null });
-      assert.equal(response.status, 400);
+      const response = await h.request("POST", "/queue/complete", { patient_id: patient.id, counterId: "Doctor 1" }, doctorUser("Doctor 1"));
+      assert.ok([400, 403].includes(response.status), response.body.message);
       assert.deepEqual(JSON.parse(JSON.stringify(await h.service.getPatientById(patient.id))), before);
       assert.equal(stored.completed_at, null);
       assert.equal((await h.service.getQueueOverview()).counters[0].current_patient_id, null);
@@ -276,15 +335,22 @@ for (const localFallback of [false, true]) {
     assert.equal(counters[1].current_patient_id, waitingOB.id);
   });
 
-  test(`${mode}: valid legacy accepted serving rows can complete without an acceptedAt entry`, async () => {
+  test(`${mode}: legacy serving rows without acceptance require explicit doctor acceptance and consultation start`, async () => {
     const h = await setup(localFallback);
     const patient = await h.service.createQueueEntry(registration("Legacy accepted patient"));
     await h.service.callPatient(patient.id, "Doctor 1");
     h.settings.resetAcceptState(patient.id);
     assert.equal(h.settings.isAwaitingAccept(patient.id), false);
     assert.equal(h.settings.getAcceptedAt(patient.id), null);
-    const response = await h.request("POST", "/queue/complete", { patient_id: patient.id });
-    assert.equal(response.status, 200);
+    const doctor = doctorUser("Doctor 1");
+    assert.equal((await h.service.getQueueOverview()).patients.find((row) => row.id === patient.id).awaiting_accept, true);
+    assert.equal((await h.request("POST", "/queue/complete", { patient_id: patient.id }, doctor)).status, 400);
+    assert.equal((await h.request("POST", "/queue/accept", { patient_id: patient.id }, doctor)).status, 200);
+    h.advance();
+    assert.equal((await h.request("POST", "/queue/start", { patient_id: patient.id }, doctor)).status, 200);
+    h.advance();
+    const response = await h.request("POST", "/queue/complete", { patient_id: patient.id }, doctor);
+    assert.equal(response.status, 200, response.body.message);
     assert.equal((await h.service.getPatientById(patient.id)).status, "completed");
     assert.ok((await h.service.getPatientById(patient.id)).completed_at);
     assert.equal((await h.service.getQueueOverview()).counters[0].current_patient_id, null);
@@ -315,7 +381,9 @@ for (const localFallback of [false, true]) {
     assert.equal(JSON.stringify(h.loadSettings().getVoiceAnnouncementEvents()), JSON.stringify(h.settings.getVoiceAnnouncementEvents()), "Acceptance and Re-Call events survive reload");
     assert.equal((await h.service.getPatientById(patient.id)).status, "serving");
     assert.equal((await h.service.getQueueOverview()).counters[0].current_patient_id, patient.id);
-    const complete = await h.request("POST", "/queue/complete", { patient_id: patient.id, counterId: "Doctor 1" });
+    await h.service.startConsultation(patient.id, doctorUser("Doctor 1"));
+    h.advance();
+    const complete = await h.request("POST", "/queue/complete", { patient_id: patient.id, counterId: "Doctor 1" }, doctorUser("Doctor 1"));
     assert.equal(complete.status, 200);
     assert.equal((await h.service.getPatientById(patient.id)).status, "completed");
     assert.ok((await h.service.getPatientById(patient.id)).completed_at);

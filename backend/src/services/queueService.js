@@ -51,6 +51,10 @@ const localData = {
 // Helper to check if Supabase is connected
 let useLocalFallback = false;
 
+function getQueueStorageMode() {
+  return useLocalFallback ? "local_fallback" : "supabase";
+}
+
 function isMissingCancellationTableError(error) {
   if (!error) return false;
   const message = String(error.message || "");
@@ -120,6 +124,7 @@ async function getCounters() {
     const { data, error } = await supabase
       .from("counters")
       .select("id, id_num, service_types, is_online, current_patient_id")
+      .in("id_num", ["Doctor 1", "Doctor 2", "Doctor 3"])
       .order("id", { ascending: true })
       .limit(3);
 
@@ -187,12 +192,32 @@ function parsePatientPriority(patient) {
   const displayFlags = flags.filter((flag) => typeof flag === "string");
   return {
     ...patient,
+    consultation_started_at: patient.consultation_started_at || null,
+    service_duration_seconds: getServiceDurationSeconds(patient),
     priority_score: patient.priority_score || 0,
     vulnerability_flags: displayFlags,
     reason: patient.reason != null && String(patient.reason).trim() !== ""
       ? patient.reason
       : (cancelMeta?.reason || null)
   };
+}
+
+function timestampMicroseconds(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) return null;
+  // PostgreSQL timestamps can contain six fractional digits. Keep their
+  // sub-millisecond precision when deriving a duration in JavaScript.
+  const fraction = value.match(/[T ]\d{2}:\d{2}:\d{2}\.(\d+)(?:Z|[+-]\d{2}(?::?\d{2})?)$/i)?.[1] || "";
+  return BigInt(milliseconds) * 1000n + BigInt(fraction.padEnd(6, "0").slice(3, 6));
+}
+
+function getServiceDurationSeconds(patient) {
+  if (patient?.status !== "completed") return null;
+  const started = timestampMicroseconds(patient.consultation_started_at);
+  const ended = timestampMicroseconds(patient.completed_at);
+  if (started == null || ended == null || ended <= started) return null;
+  return Number(ended - started) / 1000000;
 }
 
 async function getTodayPatients() {
@@ -239,10 +264,13 @@ async function getQueueOverview() {
   const settings = getQueueSettings();
 
   return {
+    storage_mode: getQueueStorageMode(),
     patients: patients.map((p) => ({
       ...p,
       recall_count: getRecallCount(p.id),
-      awaiting_accept: p.status === "serving" && isAwaitingAccept(p.id)
+      accepted_at: getAcceptedAt(p.id),
+      awaiting_accept: p.status === "serving" && (isAwaitingAccept(p.id) ||
+        (!p.consultation_started_at && !getAcceptedAt(p.id)))
     })),
     counters,
     queue_settings: settings
@@ -384,6 +412,7 @@ async function createQueueEntry({ idNum, serviceType, mobileNumber, residency, p
           status: "waiting",
           created_at: new Date().toISOString(),
           called_at: null,
+          consultation_started_at: null,
           completed_at: null,
           counter_id: null,
           reason: null
@@ -703,77 +732,166 @@ async function callPatient(patientId, counterId = null) {
   }
 }
 
-async function completePatient(patientId, reason = null, counterId = null) {
-  const existing = await getPatientById(patientId);
-  if (!existing) {
-    throw new Error("Patient not found");
-  }
-  if (existing.status !== "serving" || !existing.called_at || !existing.counter_id) {
-    throw new Error("Only a serving patient called and assigned to a doctor can be completed");
-  }
-  if (isAwaitingAccept(patientId)) {
-    throw new Error("Accept this patient before completing the consultation.");
-  }
+function consultationError(message, statusCode = 400) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+}
 
-  const trimmedReason = reason == null ? null : String(reason).trim() || null;
-  const completedAt = new Date().toISOString();
-  const assignedCounter = counterId ? String(counterId) : null;
+function requireConsultationDoctor(actor) {
+  if (actor?.role !== "admin" || !String(actor.id_num || "").trim() || !String(actor.doctor_name || "").trim()) {
+    throw consultationError("Only the authenticated assigned doctor can manage a consultation.", 403);
+  }
+}
 
-  if (useLocalFallback) {
-    const patientIndex = localData.patients.findIndex(p => p.id === patientId);
-    if (patientIndex !== -1) {
-      localData.patients[patientIndex].status = "completed";
-      localData.patients[patientIndex].completed_at = completedAt;
-      localData.patients[patientIndex].reason = trimmedReason;
-      if (assignedCounter) {
-        localData.patients[patientIndex].counter_id = assignedCounter;
-      }
+function resolveDoctorCounter(value, counters) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  if (!raw) return null;
+  const number = raw.match(/^(?:doctor\s*)?(\d+)$/)?.[1];
+  return counters.find((counter) => String(counter.id_num).trim().toLowerCase() === raw ||
+    String(counter.id) === raw || (number && String(counter.id_num).toLowerCase() === `doctor ${Number(number)}`)) || null;
+}
+
+async function loadConsultationContext(patientId, actor) {
+  requireConsultationDoctor(actor);
+  if (!Number.isSafeInteger(patientId) || patientId <= 0) throw consultationError("A valid patient ID is required");
+  const local = useLocalFallback;
+  let patient, counters, user;
+  if (local) {
+    patient = localData.patients.find((row) => row.id === patientId);
+    counters = localData.counters;
+    user = localData.users.find((row) => row.id_num === actor.id_num);
+  } else {
+    // Mutation validation never silently switches to another storage system.
+    let results;
+    try {
+      results = await Promise.all([
+        supabase.from("patients").select("*").eq("id", patientId).maybeSingle(),
+        supabase.from("counters").select("id, id_num, current_patient_id"),
+        supabase.from("users").select("id_num, role, doctor_name").eq("id_num", actor.id_num).maybeSingle()
+      ]);
+    } catch (error) {
+      throw consultationError(error.message || "Consultation database validation is unavailable", 503);
     }
-    await clearCounterAssignment(patientId);
-    return localData.patients[patientIndex];
-  }
-
-  const updatePayload = {
-    status: "completed",
-    completed_at: completedAt,
-    reason: trimmedReason
-  };
-  if (assignedCounter) {
-    updatePayload.counter_id = assignedCounter;
-  }
-  
-  let { data, error } = await supabase
-    .from("patients")
-    .update(updatePayload)
-    .eq("id", patientId)
-    .select("*")
-    .single();
-
-  // Fallback when patients.reason column has not been migrated yet
-  if (error && /reason/i.test(String(error.message || ""))) {
-    const fallbackPayload = {
-      status: "completed",
-      completed_at: completedAt
-    };
-    if (assignedCounter) {
-      fallbackPayload.counter_id = assignedCounter;
+    for (const result of results) {
+      if (result.error) throw consultationError(result.error.message || "Failed to validate consultation", 503);
     }
-
-    ({ data, error } = await supabase
-      .from("patients")
-      .update(fallbackPayload)
-      .eq("id", patientId)
-      .select("*")
-      .single());
+    patient = results[0].data;
+    counters = results[1].data || [];
+    user = results[2].data;
   }
+  if (local !== useLocalFallback) throw consultationError("Queue storage changed. Refresh and try again.", 409);
+  const counter = resolveDoctorCounter(actor.doctor_name, counters);
+  const currentDoctor = resolveDoctorCounter(user?.doctor_name, counters);
+  if (!user || user.role !== "admin" || !counter || currentDoctor?.id !== counter.id) {
+    throw consultationError("Your current account is not assigned to this doctor. Sign in again.", 403);
+  }
+  if (!patient) throw consultationError("Patient not found", 404);
+  if (patient.status !== "serving" || !patient.called_at || patient.completed_at != null) {
+    throw consultationError("Only the doctor's current serving patient with a valid call can be managed");
+  }
+  if (resolveDoctorCounter(patient.counter_id, counters)?.id !== counter.id) {
+    throw consultationError("You can only manage your assigned patient's consultation.", 403);
+  }
+  if (Number(counter.current_patient_id) !== patientId) {
+    throw consultationError("Only the doctor's current serving patient with a valid call can be managed");
+  }
+  if (counters.some((other) => other.id !== counter.id && Number(other.current_patient_id) === patientId)) {
+    throw consultationError("This patient has conflicting doctor assignments");
+  }
+  return { patient, counter, local };
+}
 
+async function getServingPatientForDoctor(patientId, actor) {
+  return (await loadConsultationContext(patientId, actor)).patient;
+}
+
+const consultationActionsInProgress = new Set();
+
+async function runConsultationAction(patientId, actor, action) {
+  requireConsultationDoctor(actor);
+  if (consultationActionsInProgress.has(patientId)) throw consultationError("A consultation action for this patient is already processing", 409);
+  consultationActionsInProgress.add(patientId);
+  try {
+    return await action(await loadConsultationContext(patientId, actor));
+  } finally {
+    consultationActionsInProgress.delete(patientId);
+  }
+}
+
+async function consultationRpc(name, params) {
+  let result;
+  try {
+    result = await supabase.rpc(name, params);
+  } catch (error) {
+    throw consultationError(error.message || "Consultation database operation is unavailable", 503);
+  }
+  const { data, error } = result;
   if (error) {
-    throw formatError(error, "Failed to complete patient");
+    if (["PGRST202", "PGRST204", "42883", "42703"].includes(error.code)) {
+      throw consultationError("Phase 2 database migration is required before starting or completing consultations.", 503);
+    }
+    const status = error.code === "42501" ? 403 : error.code === "P0002" ? 404 :
+      ["P0001", "22023"].includes(error.code) ? 400 : 503;
+    throw consultationError(error.message || "Consultation database operation failed", status);
   }
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row?.id) throw consultationError("Could not confirm the consultation update. Refresh the queue before retrying.", 503);
+  return parsePatientPriority(row);
+}
 
-  await clearCounterAssignment(patientId);
+async function startConsultation(patientId, actor) {
+  return runConsultationAction(patientId, actor, async ({ patient, counter, local }) => {
+    const acceptedAt = getAcceptedAt(patientId);
+    if (isAwaitingAccept(patientId) || !acceptedAt || !Number.isFinite(Date.parse(acceptedAt))) {
+      throw consultationError("Accept this patient before starting the consultation.");
+    }
+    if (!Number.isFinite(Date.parse(patient.called_at)) || Date.parse(acceptedAt) < Date.parse(patient.called_at)) {
+      throw consultationError("Accept the current call before starting consultation.");
+    }
+    if (patient.consultation_started_at != null) throw consultationError("Consultation has already started", 409);
+    if (!local) return consultationRpc("start_patient_consultation", {
+      p_patient_id: patientId, p_doctor_name: counter.id_num, p_user_id_num: actor.id_num, p_accepted_at: acceptedAt
+    });
+    if (patient.status !== "serving" || Number(counter.current_patient_id) !== patientId || patient.completed_at != null) {
+      throw consultationError("The patient is no longer the doctor's current serving patient", 409);
+    }
+    // Development fallback: no await between the final checks and timestamp write.
+    patient.consultation_started_at = new Date().toISOString();
+    return parsePatientPriority(patient);
+  });
+}
+
+async function completePatient(patientId, reason = null, counterId = null, actor) {
+  const row = await runConsultationAction(patientId, actor, async ({ patient, counter, local }) => {
+    if (counterId != null && resolveDoctorCounter(counterId, [counter])?.id !== counter.id) {
+      throw consultationError("The requested doctor does not own this patient", 403);
+    }
+    if (isAwaitingAccept(patientId)) throw consultationError("Accept this patient before completing the consultation.");
+    if (!patient.consultation_started_at || !Number.isFinite(Date.parse(patient.consultation_started_at))) {
+      throw consultationError("Start Consultation is required before completing this patient.");
+    }
+    const trimmedReason = reason == null ? null : String(reason).trim() || null;
+    if (!local) return consultationRpc("complete_patient_consultation", {
+      p_patient_id: patientId, p_doctor_name: counter.id_num, p_user_id_num: actor.id_num,
+      p_expected_started_at: patient.consultation_started_at, p_reason: trimmedReason
+    });
+    const completedAt = new Date().toISOString();
+    if (patient.status !== "serving" || patient.completed_at != null || Number(counter.current_patient_id) !== patientId) {
+      throw consultationError("The patient is no longer the doctor's current serving patient", 409);
+    }
+    if (timestampMicroseconds(completedAt) <= timestampMicroseconds(patient.consultation_started_at)) {
+      throw consultationError("Completion must occur after the consultation start");
+    }
+    // The patient and counter development-memory writes have no intervening await.
+    patient.status = "completed";
+    patient.completed_at = completedAt;
+    patient.reason = trimmedReason;
+    counter.current_patient_id = null;
+    return parsePatientPriority(patient);
+  });
   clearRecallCount(patientId);
-  return parsePatientPriority(data);
+  return row;
 }
 
 async function cancelPatient(patientId, reason = null, counterId = null) {
@@ -782,6 +900,7 @@ async function cancelPatient(patientId, reason = null, counterId = null) {
   if (!existing) {
     throw new Error("Patient not found");
   }
+  if (existing.status === "completed") throw new Error("A completed consultation cannot be cancelled");
 
   const trimmedReason = reason == null ? null : String(reason).trim() || null;
   const assignedDoctor = counterId || existing.counter_id || null;
@@ -814,6 +933,7 @@ async function cancelPatient(patientId, reason = null, counterId = null) {
     .from("patients")
     .update(updatePayload)
     .eq("id", patientId)
+    .eq("status", existing.status)
     .select("*")
     .single();
 
@@ -832,6 +952,7 @@ async function cancelPatient(patientId, reason = null, counterId = null) {
       .from("patients")
       .update(fallbackPayload)
       .eq("id", patientId)
+      .eq("status", existing.status)
       .select("*")
       .single());
   }
@@ -850,6 +971,9 @@ async function noShowPatient(patientId, reason = null) {
 
   if (!existing) {
     throw new Error("Patient not found");
+  }
+  if (existing.status === "completed") {
+    throw new Error("A completed consultation cannot be marked as no-show");
   }
 
   if (existing.status === "serving" && existing.called_at) {
@@ -878,10 +1002,11 @@ async function noShowPatient(patientId, reason = null) {
     .from("patients")
     .update({ status: "no-show", completed_at: new Date().toISOString(), reason })
     .eq("id", patientId)
+    .eq("status", existing.status)
     .select("*")
     .single();
 
-  if (error) {
+  if (error || !data) {
     throw formatError(error, "Failed to mark patient as no-show");
   }
 
@@ -897,6 +1022,9 @@ async function recallPatient(patientId, counterId = null) {
   }
   if (patient.status !== "serving") {
     throw new Error("Only a serving patient can be recalled");
+  }
+  if (patient.consultation_started_at || getAcceptedAt(patientId)) {
+    throw new Error("Use Re-Call for an accepted patient; the original call time must be preserved.");
   }
 
   const settings = getQueueSettings();
@@ -915,8 +1043,11 @@ async function recallPatient(patientId, counterId = null) {
     }
   }
 
+  // Acceptance can arrive while the availability query above is pending.
+  if (patient.consultation_started_at || getAcceptedAt(patientId)) {
+    throw new Error("Use Re-Call for an accepted patient; the original call time must be preserved.");
+  }
   const calledAt = new Date().toISOString();
-  const nextCount = incrementRecallCount(patientId);
 
   if (useLocalFallback) {
     const patientIndex = localData.patients.findIndex((p) => p.id === patientId);
@@ -925,17 +1056,22 @@ async function recallPatient(patientId, counterId = null) {
       localData.patients[patientIndex].status = "serving";
       if (doctor) localData.patients[patientIndex].counter_id = doctor;
     }
-    return { success: true, recall_count: nextCount, max_recalls: maxRecalls };
+    return { success: true, recall_count: incrementRecallCount(patientId), max_recalls: maxRecalls };
   }
 
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from("patients")
     .update({ called_at: calledAt, status: "serving", counter_id: doctor || patient.counter_id })
-    .eq("id", patientId);
+    .eq("id", patientId)
+    .eq("status", "serving")
+    .is("consultation_started_at", null)
+    .select("id")
+    .single();
 
-  if (error) {
+  if (error || !data) {
     throw formatError(error, "Failed to recall patient");
   }
+  const nextCount = incrementRecallCount(patientId);
 
   if (patient.mobile_number) {
     try {
@@ -959,6 +1095,9 @@ async function requeuePatient(patientId, reason = null) {
   if (!existing) {
     throw new Error("Patient not found");
   }
+  if (existing.status === "completed" && existing.consultation_started_at) {
+    throw new Error("Completed consultation history must be preserved. Register a new visit instead.");
+  }
 
   // FRD-04: Manually re-queue the patient at the bottom of the same priority tier
   // We update the created_at to now to put them at the bottom
@@ -968,6 +1107,7 @@ async function requeuePatient(patientId, reason = null) {
       localData.patients[patientIndex].status = "waiting";
       localData.patients[patientIndex].created_at = new Date().toISOString();
       localData.patients[patientIndex].completed_at = null;
+      localData.patients[patientIndex].consultation_started_at = null;
       localData.patients[patientIndex].called_at = null;
       localData.patients[patientIndex].counter_id = null;
       localData.patients[patientIndex].reason = reason;
@@ -982,11 +1122,13 @@ async function requeuePatient(patientId, reason = null) {
       status: "waiting", 
       created_at: new Date().toISOString(),
       completed_at: null,
+      consultation_started_at: null,
       called_at: null,
       counter_id: null,
       reason
     })
     .eq("id", patientId)
+    .eq("status", existing.status)
     .select("*")
     .single();
 
@@ -1004,6 +1146,9 @@ async function undoPatientAction(patientId) {
   if (!existing) {
     throw new Error("Patient not found");
   }
+  if (existing.status === "completed" && existing.consultation_started_at) {
+    throw new Error("Completed consultation history must be preserved. Register a new visit instead.");
+  }
 
   if (existing.status !== "completed" && existing.status !== "cancelled" && existing.status !== "no-show") {
     throw new Error("Only completed, cancelled, or no-show patients can be undone");
@@ -1014,14 +1159,16 @@ async function undoPatientAction(patientId) {
     if (patientIndex !== -1) {
       localData.patients[patientIndex].status = "waiting";
       localData.patients[patientIndex].completed_at = null;
+      localData.patients[patientIndex].consultation_started_at = null;
     }
     return localData.patients[patientIndex];
   }
   
   const { data, error } = await supabase
     .from("patients")
-    .update({ status: "waiting", completed_at: null })
+    .update({ status: "waiting", completed_at: null, consultation_started_at: null })
     .eq("id", patientId)
+    .eq("status", existing.status)
     .select("*")
     .single();
 
@@ -1160,7 +1307,7 @@ function buildCsv(rows) {
   }
 
   // Ensure consistent headers, including reason
-  const baseHeaders = ["id", "queue_number", "id_num", "service_type", "mobile_number", "residency", "philhealth_id", "birthdate", "sex", "priority_score", "vulnerability_flags", "source", "status", "created_at", "called_at", "completed_at", "counter_id", "reason"];
+  const baseHeaders = ["id", "queue_number", "id_num", "service_type", "mobile_number", "residency", "philhealth_id", "birthdate", "sex", "priority_score", "vulnerability_flags", "source", "status", "created_at", "called_at", "consultation_started_at", "completed_at", "service_duration_seconds", "counter_id", "reason"];
   // Use all unique keys from first row as headers, but ensure reason is included
   const headers = Array.from(new Set([...Object.keys(rows[0]), ...baseHeaders]));
   
@@ -1317,6 +1464,7 @@ async function getDisplayData() {
 
   return {
     settings: settings,
+    storage_mode: getQueueStorageMode(),
     queue_settings: getQueueSettings(),
     voice_announcements: voiceAnnouncements,
     recent_accepted: recentAccepted,
@@ -1369,8 +1517,9 @@ async function getAnalytics(startDate, endDate) {
       waitSamples += 1;
     }
 
-    if (row.called_at && row.completed_at) {
-      totalServiceMinutes += Math.round((new Date(row.completed_at) - new Date(row.called_at)) / 60000);
+    const serviceDuration = getServiceDurationSeconds(row);
+    if (serviceDuration != null) {
+      totalServiceMinutes += serviceDuration / 60;
       serviceSamples += 1;
     }
   });
@@ -1387,8 +1536,9 @@ async function getAnalytics(startDate, endDate) {
         .map((row) => Math.round((new Date(row.called_at || row.completed_at) - new Date(row.created_at)) / 60000));
 
       const serviceDurations = serviceRows
-        .filter((row) => row.called_at && row.completed_at)
-        .map((row) => Math.round((new Date(row.completed_at) - new Date(row.called_at)) / 60000));
+        .map(getServiceDurationSeconds)
+        .filter((duration) => duration != null)
+        .map((duration) => duration / 60);
 
       return {
         service_type: serviceType,
@@ -1447,7 +1597,7 @@ async function getAnalytics(startDate, endDate) {
 
 async function seedCounters() {
   if (useLocalFallback) {
-    return { created: 3 };
+    return { created: 0 };
   }
   
   const desiredCounters = [
@@ -1456,38 +1606,20 @@ async function seedCounters() {
     { name: "Doctor 3", services: ["family_planning"] }
   ];
 
-  try {
-    // 1. Remove ALL existing counters to ensure a clean slate
-    const { error: deleteError } = await supabase
-      .from("counters")
-      .delete()
-      .neq("id", 0);
-
-    if (deleteError) {
-      console.warn("Warning: Failed to clear counters:", deleteError.message);
-      useLocalFallback = true;
-      return { created: 3 };
-    }
-
-    // 2. Add the desired counters
-    const payload = desiredCounters.map((config) => ({
-      id_num: config.name,
-      service_types: config.services,
-      is_online: true
-    }));
-
-    const { error } = await supabase.from("counters").insert(payload);
-
-    if (error) {
-      throw formatError(error, "Failed to seed counters");
-    }
-
-    return { created: payload.length };
-  } catch (error) {
-    console.warn("Supabase unavailable, using local fallback:", error.message);
-    useLocalFallback = true;
-    return { created: 3 };
+  const payload = desiredCounters.map((config) => ({
+    id_num: config.name,
+    service_types: config.services,
+    is_online: true
+  }));
+  // Startup must preserve persisted doctor IDs, availability and active patient
+  // pointers. ON CONFLICT DO NOTHING also makes concurrent startups harmless.
+  const { data, error } = await supabase.from("counters")
+    .upsert(payload, { onConflict: "id_num", ignoreDuplicates: true })
+    .select("id");
+  if (error) {
+    throw formatError(error, "Failed to seed missing counters");
   }
+  return { created: (data || []).length };
 }
 
 async function renameServiceType(oldValue, newValue) {
@@ -1969,6 +2101,8 @@ module.exports = {
   cancelPatient,
   clearTodaysQueues,
   completePatient,
+  startConsultation,
+  getServingPatientForDoctor,
   createQueueEntry,
   findActiveDuplicate,
   getAnalytics,
@@ -1978,6 +2112,7 @@ module.exports = {
   getPatientById,
   getPatientsForExport,
   getQueueOverview,
+  getQueueStorageMode,
   getQueueStats,
   getTransactions,
   renameServiceType,

@@ -6,6 +6,13 @@ const crypto = require("node:crypto");
 const backendDir = path.resolve(__dirname, "../..");
 const clone = (value) => JSON.parse(JSON.stringify(value));
 
+// PostgreSQL equality includes microseconds, which JavaScript Date discards.
+function timestampMicroseconds(value) {
+  if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) return null;
+  const fraction = value.match(/\.(\d+)(?:Z|[+-]\d{2}(?::?\d{2})?)$/i)?.[1] || "";
+  return BigInt(Date.parse(value)) * 1000n + BigInt(fraction.padEnd(6, "0").slice(3, 6));
+}
+
 function createDatabase() {
   return {
     patients: [],
@@ -15,8 +22,17 @@ function createDatabase() {
       { id: 3, id_num: "Doctor 3", service_types: ["family_planning"], is_online: true, current_patient_id: null }
     ],
     display_settings: [{ id: 1, company_name: "Test Health Office", refresh_interval: 5 }],
+    users: [
+      { id_num: "admin1", role: "admin", doctor_name: "Doctor 1" },
+      { id_num: "admin2", role: "admin", doctor_name: "Doctor 2" },
+      { id_num: "admin3", role: "admin", doctor_name: "Doctor 3" },
+      { id_num: "frontdesk", role: "admin", doctor_name: null },
+      { id_num: "superadmin", role: "superadmin", doctor_name: null }
+    ],
     calls: [],
-    beforeQuery: null
+    beforeQuery: null,
+    beforeRpc: null,
+    beforeRpcCommit: null
   };
 }
 
@@ -35,6 +51,7 @@ function fakeSupabase(database, now, localFallback) {
     select(columns = "*") { this.columns = columns; return this; }
     update(payload) { this.action = "update"; this.payload = clone(payload); return this; }
     insert(payload) { this.action = "insert"; this.payload = clone(payload); return this; }
+    upsert(payload, options = {}) { this.action = "upsert"; this.payload = clone(payload); this.upsertOptions = options; return this; }
     eq(key, value) { this.filters.push((row) => row[key] === value); return this; }
     neq(key, value) { this.filters.push((row) => row[key] !== value); return this; }
     is(key, value) { this.filters.push((row) => row[key] === value); return this; }
@@ -44,7 +61,7 @@ function fakeSupabase(database, now, localFallback) {
     like(key, value) { this.filters.push((row) => String(row[key]).startsWith(value.replace(/%$/, ""))); return this; }
     order(key, options = {}) { this.orders.push({ key, ascending: options.ascending !== false }); return this; }
     limit(value) { this.maximum = value; return this; }
-    single() { this.singular = true; return this.execute(); }
+    single() { this.singular = true; this.required = true; return this.execute(); }
     maybeSingle() { this.singular = true; return this.execute(); }
     then(resolve, reject) { return this.execute().then(resolve, reject); }
     async execute() {
@@ -57,18 +74,27 @@ function fakeSupabase(database, now, localFallback) {
       const table = database[this.table];
       if (!Array.isArray(table)) throw new Error(`Unexpected table: ${this.table}`);
       let rows;
-      if (this.action === "insert") {
+      if (this.action === "insert" || this.action === "upsert") {
         const payloads = Array.isArray(this.payload) ? this.payload : [this.payload];
-        rows = payloads.map((payload) => ({
-          id: Math.max(0, ...table.map((row) => row.id)) + 1,
-          created_at: new Date(now()).toISOString(),
-          called_at: null,
-          completed_at: null,
-          counter_id: null,
-          reason: null,
-          ...payload
-        }));
-        table.push(...rows);
+        let nextId = Math.max(0, ...table.map((row) => Number(row.id) || 0)) + 1;
+        rows = [];
+        for (const payload of payloads) {
+          const conflictKeys = (this.upsertOptions?.onConflict || "id").split(",").map((key) => key.trim());
+          const existing = this.action === "upsert" && table.find((row) => conflictKeys.every((key) => row[key] === payload[key]));
+          if (existing) {
+            if (!this.upsertOptions.ignoreDuplicates) {
+              Object.assign(existing, payload);
+              rows.push(existing);
+            }
+            continue;
+          }
+          const defaults = this.table === "counters"
+            ? { service_types: [], is_online: true, current_patient_id: null }
+            : { called_at: null, completed_at: null, consultation_started_at: null, counter_id: null, reason: null };
+          const inserted = { id: nextId++, created_at: new Date(now()).toISOString(), ...defaults, ...payload };
+          table.push(inserted);
+          rows.push(inserted);
+        }
       } else {
         rows = table.filter((row) => this.filters.every((filter) => filter(row)));
         if (this.action === "update") rows.forEach((row) => Object.assign(row, this.payload));
@@ -81,10 +107,84 @@ function fakeSupabase(database, now, localFallback) {
         if (this.columns === "*") return clone(row);
         return Object.fromEntries(this.columns.split(",").map((key) => [key.trim(), clone(row[key.trim()] ?? null)]));
       });
+      if (this.required && rows.length !== 1) return { data: null, error: { code: "PGRST116", message: "JSON object requested, multiple (or no) rows returned" } };
       return { data: this.singular ? rows[0] || null : rows, error: null };
     }
   }
-  return { from: (table) => new Query(table) };
+  // Model the RPC boundary and all-or-nothing commit for service/route tests.
+  // This does not execute the SQL migration or prove PostgreSQL locking behavior.
+  async function rpc(name, args) {
+    database.calls.push({ action: "rpc", function: name, args: clone(args) });
+    if (localFallback) return { data: null, error: { message: "Supabase unreachable (isolated test)" } };
+    if (database.beforeRpc) {
+      const result = await database.beforeRpc(name, args);
+      if (result) return result;
+    }
+    if (name === "complete_patient_consultation" && !Object.hasOwn(args, "p_expected_started_at")) {
+      return { data: null, error: { code: "PGRST202", message: "Required completion RPC argument p_expected_started_at is missing" } };
+    }
+    const previous = database.rpcQueue || Promise.resolve();
+    let release;
+    database.rpcQueue = new Promise((resolve) => { release = resolve; });
+    await previous;
+    try {
+      const patients = clone(database.patients);
+      const counters = clone(database.counters);
+      const patient = patients.find((row) => row.id === args.p_patient_id);
+      const counter = counters.find((row) => row.id_num === args.p_doctor_name);
+      const user = database.users.find((row) => row.id_num === args.p_user_id_num);
+      if (!user || user.role !== "admin" || user.doctor_name !== args.p_doctor_name) {
+        return { data: null, error: { code: "42501", message: "Authenticated doctor identity no longer matches" } };
+      }
+      if (!patient) return { data: null, error: { code: "P0001", message: "Patient not found" } };
+      if (patient.counter_id !== args.p_doctor_name || !counter || counter.current_patient_id !== patient.id) {
+        return { data: null, error: { code: "P0001", message: "Patient is not assigned to this doctor's active counter" } };
+      }
+      if (counters.some((row) => row.id_num !== args.p_doctor_name && row.current_patient_id === patient.id)) {
+        return { data: null, error: { code: "P0001", message: "Patient has a conflicting active counter assignment" } };
+      }
+      if (patient.status !== "serving" || !patient.called_at || patient.completed_at) {
+        return { data: null, error: { code: "P0001", message: "Only an active serving patient can receive consultation actions" } };
+      }
+      const timestamp = new Date(database.clock ? database.clock.now : now()).toISOString();
+      if (name === "start_patient_consultation") {
+        if (patient.consultation_started_at) return { data: null, error: { code: "P0001", message: "Consultation has already started" } };
+        if (!args.p_accepted_at || !Number.isFinite(Date.parse(args.p_accepted_at))) {
+          return { data: null, error: { code: "P0001", message: "A valid doctor acceptance is required before starting consultation" } };
+        }
+        if (Date.parse(args.p_accepted_at) < Date.parse(patient.called_at)) {
+          return { data: null, error: { code: "P0001", message: "Accept the current call before starting consultation" } };
+        }
+        patient.consultation_started_at = timestamp;
+      } else if (name === "complete_patient_consultation") {
+        if (!patient.consultation_started_at || Date.parse(timestamp) <= Date.parse(patient.consultation_started_at)) {
+          return { data: null, error: { code: "P0001", message: "Start consultation before completing it; completion must be after the start" } };
+        }
+        const expectedStart = timestampMicroseconds(args.p_expected_started_at);
+        if (expectedStart === null) {
+          return { data: null, error: { code: "P0001", message: "An expected consultation start is required" } };
+        }
+        if (expectedStart !== timestampMicroseconds(patient.consultation_started_at)) {
+          return { data: null, error: { code: "P0001", message: "Consultation attempt changed; refresh before completing" } };
+        }
+        patient.status = "completed";
+        patient.completed_at = timestamp;
+        patient.reason = args.p_reason || null;
+        counter.current_patient_id = null;
+      } else {
+        throw new Error(`Unexpected RPC: ${name}`);
+      }
+      if (database.beforeRpcCommit) await database.beforeRpcCommit({ name, args, patients, counters });
+      database.patients.splice(0, database.patients.length, ...patients);
+      database.counters.splice(0, database.counters.length, ...counters);
+      return { data: database.rpcReturnsArray ? [clone(patient)] : clone(patient), error: null };
+    } catch (error) {
+      return { data: null, error: { code: "P0001", message: error.message } };
+    } finally {
+      release();
+    }
+  }
+  return { from: (table) => new Query(table), rpc };
 }
 
 function createVirtualFs(files = new Map()) {
@@ -128,8 +228,11 @@ function createHarness(options = {}) {
   const loadSettings = () => loadModule("src/services/settingsService.js", { fs: virtualFs, path, crypto }, clock);
   const settings = loadSettings();
   const notifications = [];
+  const supabase = fakeSupabase(database, () => clock.now, options.localFallback);
+  // SQL integration tests retain isolated reads while executing real migration RPCs.
+  if (options.rpc) supabase.rpc = options.rpc;
   const service = loadModule("src/services/queueService.js", {
-    "../lib/supabase": fakeSupabase(database, () => clock.now, options.localFallback),
+    "../lib/supabase": supabase,
     bcryptjs: {},
     "./notificationService": {
       sendQueueCreatedNotification: (...args) => notifications.push({ type: "created", args }),
@@ -140,13 +243,18 @@ function createHarness(options = {}) {
   const handlers = new Map();
   const router = {};
   for (const method of ["get", "post", "put", "delete"]) {
-    router[method] = (route, ...middleware) => handlers.set(`${method.toUpperCase()} ${route}`, middleware.at(-1));
+    router[method] = (route, ...middleware) => handlers.set(`${method.toUpperCase()} ${route}`, middleware);
   }
   loadModule("src/routes/index.js", {
     express: { Router: () => router },
     jsonwebtoken: {},
     "../config/env": {},
-    "../middleware/auth": { authenticateToken() {}, authorizeRole: () => () => {} },
+    "../middleware/auth": {
+      // Requests provide an already verified identity. JWT cryptography itself
+      // is outside this isolated route/service harness.
+      authenticateToken: (req, res, next) => req.user ? next() : res.status(401).json({ success: false, message: "Authentication required" }),
+      authorizeRole: (roles) => (req, res, next) => roles.includes(req.user?.role) ? next() : res.status(403).json({ success: false, message: "Unauthorized access" })
+    },
     "../services/queueService": service,
     "../services/settingsService": settings
   }, clock);
@@ -157,10 +265,18 @@ function createHarness(options = {}) {
       if (options.localFallback) await service.getDisplaySettings();
     },
     async request(method, route, body = {}, user = { id_num: "frontdesk", role: "admin", doctor_name: null }) {
-      const handler = handlers.get(`${method.toUpperCase()} ${route}`);
-      if (!handler) throw new Error(`Missing route ${method} ${route}`);
+      const middleware = handlers.get(`${method.toUpperCase()} ${route}`);
+      if (!middleware) throw new Error(`Missing route ${method} ${route}`);
       const response = { statusCode: 200, status(code) { this.statusCode = code; return this; }, json(data) { this.body = clone(data); return this; } };
-      await handler({ body, user, query: {}, params: {} }, response);
+      const request = { body, user, query: {}, params: {} };
+      const run = async (index) => {
+        const handler = middleware[index];
+        if (!handler) return;
+        let nextResult;
+        await handler(request, response, () => { nextResult = run(index + 1); return nextResult; });
+        if (nextResult) await nextResult;
+      };
+      await run(0);
       return { status: response.statusCode, body: response.body };
     },
     advance(milliseconds = 1000) { clock.now += milliseconds; }

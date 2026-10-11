@@ -209,19 +209,6 @@ export default function PatientQueueTable({
     }
   }
 
-  function handleComplete(row, doctorName) {
-    if (pendingCallsRef.current.has(doctorName)) return;
-    if (row.awaiting_accept) {
-      onNotify("error", "The assigned doctor must accept this patient before completion.");
-      return;
-    }
-    if (!isHead(row, doctorName)) {
-      onNotify("error", `You can only complete the patient ${doctorName} is currently serving.`);
-      return;
-    }
-    runAction(doctorName, "/queue/complete", { patient_id: row.id }, "Patient completed successfully");
-  }
-
   function handleCancel(row, doctorName) {
     if (pendingCallsRef.current.has(doctorName)) return;
     if (!isHead(row, doctorName)) {
@@ -294,14 +281,9 @@ export default function PatientQueueTable({
     if (row.status === "serving" && isHead(row, doctorName)) {
       return (
         <>
-          <button
-            type="button"
-            onClick={() => handleComplete(row, doctorName)}
-            disabled={calling || row.awaiting_accept}
-            className="px-3 py-1.5 bg-blue-600 text-white rounded-lg text-xs font-bold hover:bg-blue-700 transition-colors"
-          >
-            Complete
-          </button>
+          <span className="text-[11px] brand-text-muted font-semibold px-1">
+            {row.consultation_started_at ? "Consultation in progress" : row.awaiting_accept ? "Awaiting doctor acceptance" : "Ready for consultation"}
+          </span>
           <button
             type="button"
             onClick={() => handleCancel(row, doctorName)}

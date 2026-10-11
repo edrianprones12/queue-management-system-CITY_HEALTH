@@ -24,7 +24,7 @@ const displayFunctions = [
   sourceSection("  async function loadDisplay(", "  const formatTime =")
 ].join("\n");
 
-function createDisplayHarness({ enabled = true, settings = {}, speak = null } = {}) {
+function createDisplayHarness({ enabled = true, settings = {}, speak = null, bell = null } = {}) {
   const speech = [];
   let response = {};
   const refs = {
@@ -56,7 +56,9 @@ function createDisplayHarness({ enabled = true, settings = {}, speak = null } = 
       assert.equal(url, "/display");
       return response;
     },
-    async playNotificationBell() {},
+    async playNotificationBell() {
+      if (bell) await bell();
+    },
     async checkPyttsx3Service() {},
     async fetchJsonWithTimeout(url, options, timeoutMs) {
       assert.equal(url, "http://isolated-tts.test/speak");
@@ -186,6 +188,37 @@ test("existing announcement wording preserves queue number, patient name, doctor
   assert.equal(harness.speech[0].wait, true);
   assert.equal(harness.speech[0].timeout_seconds, 45);
   assert.equal(harness.speech[0].gap_ms, 3000);
+});
+
+test("pyttsx3 speech waits until the notification chime finishes", async () => {
+  let finishBell;
+  let notifyBellStarted;
+  let speakRequests = 0;
+  const bellFinished = new Promise((resolve) => { finishBell = resolve; });
+  const bellStarted = new Promise((resolve) => { notifyBellStarted = resolve; });
+  const harness = createDisplayHarness({
+    bell() {
+      notifyBellStarted();
+      return bellFinished;
+    },
+    speak() { speakRequests += 1; }
+  });
+  harness.seed();
+  const polling = harness.poll({
+    recent_accepted: [calledPatient({ accepted_at: "2026-10-10T01:01:00.000Z" })]
+  });
+
+  await bellStarted;
+  await new Promise((resolve) => setImmediate(resolve));
+  try {
+    assert.equal(speakRequests, 0, "The voice request must wait for the chime to finish");
+    assert.equal(harness.speech.length, 0);
+  } finally {
+    finishBell();
+  }
+  await polling;
+  assert.equal(speakRequests, 1);
+  assert.equal(harness.speech.length, 1);
 });
 
 test("each accepted patient's announcement keeps its assigned doctor's room", async () => {

@@ -20,7 +20,8 @@ before(async () => {
 function patient(id, service = "consultation", score = 1, created = "2026-10-10T01:00:00Z") {
   return { id, id_num: `Test ${id}`, queue_number: `GP-${id}`, service_type: service,
     status: "waiting", priority_score: score, created_at: created,
-    counter_id: null, called_at: null, completed_at: null, vulnerability_flags: [] };
+    counter_id: null, called_at: null, accepted_at: null, consultation_started_at: null,
+    completed_at: null, vulnerability_flags: [] };
 }
 
 function harness(rows, options = {}) {
@@ -35,7 +36,7 @@ function harness(rows, options = {}) {
     counters: [1, 2, 3].map(number => ({ id_num: `Doctor ${number}`, is_online: true, current_patient_id: null })),
     queueRows: rows, queueSettings: {},
     onRefresh: async () => { refreshes++; await options.refresh?.(props); },
-    onNotify: (...args) => notices.push(args), onConfirm: () => {}, ...options.props
+    onNotify: (...args) => notices.push(args), onConfirm: options.confirm || (() => {}), ...options.props
   };
   const react = {
     useMemo: callback => callback(),
@@ -151,27 +152,54 @@ test("a pending Doctor 1 call leaves Doctor 2 and Doctor 3 independently callabl
   await Promise.all([first, second, third]);
 });
 
-test("only Complete invokes completion, hides the active row, and retains it in completed records", async () => {
-  const serving = { ...patient(1), status: "serving", counter_id: "Doctor 1", called_at: "2026-10-10T01:01:00Z" };
+test("a doctor's completion refresh hides the active row and retains consultation timestamps in completed records", async () => {
+  const serving = { ...patient(1), status: "serving", counter_id: "Doctor 1", called_at: "2026-10-10T01:01:00Z",
+    accepted_at: "2026-10-10T01:02:00Z", consultation_started_at: "2026-10-10T01:03:00Z" };
   const h = harness([serving], { refresh: async props => {
-    props.queueRows = [{ ...serving, status: "completed", completed_at: "2026-10-10T01:10:00Z" }];
+    props.queueRows = [{ ...serving, status: "completed", completed_at: "2026-10-10T01:10:00Z", service_duration_seconds: 420 }];
   } });
   assert.equal(buttons(h.render(), "Call Now").length, 0);
-  buttons(h.render(), "Complete")[0].props.onClick();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(h.calls[0].route, "/queue/complete");
+  assert.equal(buttons(h.render(), "Complete").length, 0);
+  await h.props.onRefresh();
   assert.doesNotMatch(text(h.render()), /Test 1/);
   h.props.statusFilter = "completed";
   assert.match(text(h.render()), /Test 1/);
+  assert.equal(h.props.queueRows[0].consultation_started_at, serving.consultation_started_at);
+  assert.equal(h.props.queueRows[0].service_duration_seconds, 420);
+  assert.equal(buttons(h.render(), "Undo").length, 0);
+  assert.equal(buttons(h.render(), "Re-queue").length, 0);
+  assert.deepEqual(h.calls, [], "Frontdesk never submits a consultation completion");
 });
 
-test("Frontdesk completion is disabled until the called patient is accepted by the doctor", async () => {
+test("Frontdesk monitors called, accepted and started phases without exposing consultation mutations", async () => {
+  for (const [phase, label] of [
+    [{ awaiting_accept: true }, "Awaiting doctor acceptance"],
+    [{ awaiting_accept: false, accepted_at: "2026-10-10T01:02:00Z" }, "Ready for consultation"],
+    [{ awaiting_accept: false, accepted_at: "2026-10-10T01:02:00Z", consultation_started_at: "2026-10-10T01:03:00Z" }, "Consultation in progress"]
+  ]) {
+    const h = harness([{ ...patient(1), status: "serving", counter_id: "Doctor 1",
+      called_at: "2026-10-10T01:01:00Z", ...phase }]);
+    assert.ok(text(h.render()).includes(label));
+    for (const action of ["Call Now", "Accept", "Start Consultation", "Complete", "Complete Consultation"])
+      assert.equal(buttons(h.render(), action).length, 0);
+    assert.equal(buttons(h.render(), "Cancel").length, 1);
+    assert.deepEqual(h.calls, []);
+    assert.equal(h.props.queueRows[0].status, "serving");
+    assert.equal(h.props.queueRows[0].completed_at, null);
+  }
+});
+
+test("Frontdesk cancellation retains the existing reason and doctor payload during consultation", async () => {
+  let confirmation;
   const h = harness([{ ...patient(1), status: "serving", counter_id: "Doctor 1",
-    called_at: "2026-10-10T01:01:00Z", awaiting_accept: true }]);
-  const button = buttons(h.render(), "Complete")[0];
-  assert.equal(button.props.disabled, true);
-  button.props.onClick();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(h.calls.length, 0);
-  assert.match(h.notices[0][1], /accept.*before completion/);
+    called_at: "2026-10-10T01:01:00Z", accepted_at: "2026-10-10T01:02:00Z",
+    consultation_started_at: "2026-10-10T01:03:00Z" }], { confirm: value => { confirmation = value; } });
+  buttons(h.render(), "Cancel")[0].props.onClick();
+  assert.equal(confirmation.requireReason, true);
+  await confirmation.onConfirm("Patient requested cancellation");
+  assert.deepEqual(h.calls, [{ route: "/queue/cancel", method: "POST", body: {
+    patient_id: 1, reason: "Patient requested cancellation", counter_id: "Doctor 1"
+  } }]);
+  assert.equal(h.refreshes, 1);
+  assert.equal(h.props.queueRows[0].completed_at, null, "only backend refresh can change patient timestamps");
 });

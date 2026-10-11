@@ -12,6 +12,8 @@ const {
   undoPatientAction,
   clearTodaysQueues,
   completePatient,
+  startConsultation,
+  getServingPatientForDoctor,
   createQueueEntry,
   getAnalytics,
   getDisplayData,
@@ -19,6 +21,7 @@ const {
   getPatientById,
   getPatientsForExport,
   getQueueOverview,
+  getQueueStorageMode,
   getQueueStats,
   getTransactions,
   renameServiceType,
@@ -38,6 +41,7 @@ const {
   getQueueSettings,
   saveQueueSettings,
   isAwaitingAccept,
+  getAcceptedAt,
   markAccepted,
   clearAwaitingAccept,
   resetAcceptState,
@@ -167,13 +171,18 @@ router.post("/queue/call", authenticateToken, async (req, res) => {
       return res.status(400).json({ success: false, message: "Conflicting doctor assignments" });
     }
     const requestedDoctor = counterId ?? counter_id ?? null;
-    if (req.user?.doctor_name && requestedDoctor != null && requestedDoctor !== req.user.doctor_name) {
+    // Older frontdesk accounts store their display label in doctor_name.
+    // Treat that label as unassigned while keeping actual doctor restrictions.
+    const accountAssignment = req.user?.doctor_name ?? null;
+    const accountDoctor = ["front desk", "frontdesk"].includes(String(accountAssignment ?? "").trim().toLowerCase())
+      ? null : accountAssignment;
+    if (accountDoctor && requestedDoctor != null && requestedDoctor !== accountDoctor) {
       return res.status(403).json({ success: false, message: "You can only call patients assigned to your doctor." });
     }
-    await callPatient(Number(patient_id), requestedDoctor ?? req.user?.doctor_name ?? null);
+    await callPatient(Number(patient_id), requestedDoctor ?? accountDoctor);
     console.info("[voice][queue-call]", {
       patient_id: Number(patient_id),
-      requested_counter: requestedDoctor ?? req.user?.doctor_name ?? null,
+      requested_counter: requestedDoctor ?? accountDoctor,
       at: new Date().toISOString()
     });
     res.json({ success: true, message: "Patient called successfully" });
@@ -185,15 +194,11 @@ router.post("/queue/call", authenticateToken, async (req, res) => {
 router.post("/queue/accept", authenticateToken, async (req, res) => {
   try {
     const patientId = Number(req.body.patient_id);
-    const patient = await getPatientById(patientId);
-    if (!patient) {
-      return res.status(404).json({ success: false, message: "Patient not found" });
-    }
-    if (patient.status !== "serving" || !isAwaitingAccept(patientId)) {
+    const patient = await getServingPatientForDoctor(patientId, req.user);
+    // A legacy serving row with a missing acceptance file must be explicitly
+    // accepted by its doctor; never invent an acceptance/start timestamp.
+    if (patient.consultation_started_at || (!isAwaitingAccept(patientId) && getAcceptedAt(patientId))) {
       return res.status(400).json({ success: false, message: "This patient is not waiting to be accepted" });
-    }
-    if (req.user?.doctor_name && patient.counter_id !== req.user.doctor_name) {
-      return res.status(403).json({ success: false, message: "You can only accept your assigned patient." });
     }
     const acceptedAt = markAccepted(patientId);
     const announcement = recordVoiceAnnouncementEvent({ patient, eventType: "accept", eventAt: acceptedAt });
@@ -212,7 +217,16 @@ router.post("/queue/accept", authenticateToken, async (req, res) => {
       message: "Patient accepted"
     });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.statusCode || 400).json({ success: false, message: error.message });
+  }
+});
+
+router.post("/queue/start", authenticateToken, async (req, res) => {
+  try {
+    const patient = await startConsultation(Number(req.body.patient_id), req.user);
+    res.json({ success: true, patient, storage_mode: getQueueStorageMode(), message: "Consultation started successfully" });
+  } catch (error) {
+    res.status(error.statusCode || 400).json({ success: false, message: error.message });
   }
 });
 
@@ -228,7 +242,7 @@ router.post("/queue/re-call", authenticateToken, async (req, res) => {
       return res.status(400).json({ success: false, message: "Only the current serving patient can be re-called" });
     }
 
-    if (isAwaitingAccept(patientId)) {
+    if (isAwaitingAccept(patientId) || (!getAcceptedAt(patientId) && !patient.consultation_started_at)) {
       return res.status(400).json({ success: false, message: "Accept this patient before using Re-Call." });
     }
 
@@ -275,11 +289,14 @@ router.post("/queue/re-call", authenticateToken, async (req, res) => {
 router.post("/queue/complete", authenticateToken, async (req, res) => {
   try {
     const { patient_id, reason, counter_id, counterId } = req.body;
-    await completePatient(Number(patient_id), reason, counter_id || counterId || null);
+    if (counter_id != null && counterId != null && String(counter_id) !== String(counterId)) {
+      return res.status(400).json({ success: false, message: "Conflicting doctor assignments" });
+    }
+    const patient = await completePatient(Number(patient_id), reason, counter_id ?? counterId ?? null, req.user);
     clearAwaitingAccept(patient_id);
-    res.json({ success: true, message: "Patient completed successfully" });
+    res.json({ success: true, patient, storage_mode: getQueueStorageMode(), message: "Consultation completed successfully" });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.statusCode || 400).json({ success: false, message: error.message });
   }
 });
 

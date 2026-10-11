@@ -44,7 +44,10 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
   const [loading, setLoading] = useState(false);
+  const [storageMode, setStorageMode] = useState(null);
   const [recallCooldown, setRecallCooldown] = useState(false);
+  const [pendingActions, setPendingActions] = useState({});
+  const pendingActionsRef = useRef(new Set());
   // Modal state
   const [modal, setModal] = useState({
     isOpen: false,
@@ -58,6 +61,7 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
   });
   const modalReasonRef = useRef("");
   const modalConfirmRef = useRef(null);
+  const modalSubmittingRef = useRef(false);
   const recallCooldownTimerRef = useRef(null);
   const [cancelAccountModal, setCancelAccountModal] = useState({
     isOpen: false,
@@ -70,16 +74,9 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
 
   async function handleUndo(patientId) {
     try {
-      const data = await request("/queue/undo", { 
-        method: "POST", 
-        body: JSON.stringify({ patient_id: patientId }) 
-      });
-      if (data?.error) {
-        throw new Error(data.error);
-      }
-      refreshAll();
+      await performPatientAction(patientId, "undo", "/queue/undo", { patient_id: patientId }, "Patient returned to the queue");
     } catch (err) {
-      alert(err.message);
+      showActionError(err, "Failed to undo cancellation");
     }
   }
 
@@ -100,7 +97,7 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
   };
 
   async function handleModalConfirm() {
-    if (modal.submitting) return;
+    if (modalSubmittingRef.current) return;
 
     const reason = String(modalReasonRef.current || "").trim();
     if (modal.requireReason && !reason) {
@@ -111,6 +108,7 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
       return;
     }
 
+    modalSubmittingRef.current = true;
     setModal((prev) => ({ ...prev, submitting: true, error: "" }));
     try {
       await modalConfirmRef.current?.(reason);
@@ -132,11 +130,13 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
         submitting: false,
         error: err.message || "Action failed"
       }));
+    } finally {
+      modalSubmittingRef.current = false;
     }
   }
 
   function handleModalCancel() {
-    if (modal.submitting) return;
+    if (modalSubmittingRef.current) return;
     setModal({
       isOpen: false,
       title: "",
@@ -330,12 +330,65 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
         (row) =>
           row.status === "serving" &&
           isAssignedToDoctor(row, doctorName, counters) &&
-          !row.awaiting_accept
+          !row.awaiting_accept && (row.accepted_at || row.consultation_started_at)
       ) || null,
     [filteredRows, doctorName, counters]
   );
 
-  const canProcessPatient = (row) => row?.id != null && row.id === activePatientId;
+  const canProcessPatient = (row) =>
+    row?.id != null && Number(row.id) === Number(activePatientId) &&
+    isAssignedToDoctor(row, doctorName, counters);
+  const canManageConsultation = user?.role === "admin" &&
+    normalizeDoctorAssignment(user?.doctor_name, counters) === doctorName;
+  const isAccepted = (row) => !row?.awaiting_accept &&
+    Boolean(row?.accepted_at || row?.consultation_started_at);
+  const isActionPending = (patientId) => Boolean(pendingActions[String(patientId)]);
+
+  function requireServingPatient(patientId) {
+    const row = queueRows.find((patient) => Number(patient.id) === Number(patientId));
+    if (!row || row.status !== "serving" || !row.called_at || !canProcessPatient(row)) {
+      throw new Error("You can only act on the patient currently assigned to this doctor.");
+    }
+    if (!currentCounter || Number(currentCounter.current_patient_id) !== Number(patientId)) {
+      throw new Error("The doctor counter no longer has this patient. Refresh the queue before continuing.");
+    }
+    return row;
+  }
+
+  function showActionError(err, fallback) {
+    setError(err.message || fallback);
+    window.setTimeout(() => setError(""), 5000);
+  }
+
+  // The ref closes the gap between a click and React's next render. All actions
+  // for a patient share the lock and retain it until the queue refresh finishes.
+  async function performPatientAction(patientId, action, route, payload, fallbackMessage) {
+    const key = String(patientId);
+    if (pendingActionsRef.current.has(key)) return null;
+    pendingActionsRef.current.add(key);
+    setPendingActions((previous) => ({ ...previous, [key]: action }));
+    try {
+      setError("");
+      const data = await request(route, { method: "POST", body: JSON.stringify(payload) });
+      if (data?.error || data?.success === false) {
+        throw new Error(data.error || data.message || "Patient action failed");
+      }
+      await refreshAll();
+      setSuccessMessage(data.message || fallbackMessage);
+      window.setTimeout(() => setSuccessMessage(""), 4000);
+      return data;
+    } catch (err) {
+      await refreshAll();
+      throw err;
+    } finally {
+      pendingActionsRef.current.delete(key);
+      setPendingActions((previous) => {
+        const next = { ...previous };
+        delete next[key];
+        return next;
+      });
+    }
+  }
 
   const doctorIsOnline = useMemo(() => {
     const counter = counters.find((c) => c.id_num === doctorName);
@@ -383,6 +436,7 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
       
       setQueueRows(data.patients ?? []);
       setCounters(data.counters ?? []);
+      setStorageMode(data.storage_mode ?? null);
       if (data.queue_settings) {
         setQueueSettings(mergeQueueSettings(data.queue_settings));
       }
@@ -410,31 +464,31 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
   }
 
   async function handleAccept(patientId) {
-    if (Number(patientId) !== Number(activePatientId)) {
-      setError("You can only accept the patient currently being processed.");
-      window.setTimeout(() => setError(""), 4000);
-      return;
-    }
+    if (pendingActionsRef.current.has(String(patientId))) return;
     try {
-      setError("");
-      const data = await request("/queue/accept", {
-        method: "POST",
-        body: JSON.stringify({ patient_id: patientId })
-      });
-      if (data?.error) {
-        throw new Error(data.error);
-      }
-      setSuccessMessage(data.message || "Patient accepted");
-      window.setTimeout(() => setSuccessMessage(""), 4000);
-      await refreshAll();
+      const row = requireServingPatient(patientId);
+      if (!row.awaiting_accept) throw new Error("This patient is not awaiting acceptance.");
+      await performPatientAction(patientId, "accept", "/queue/accept", { patient_id: patientId }, "Patient accepted");
     } catch (err) {
-      setError(err.message || "Failed to accept patient");
-      window.setTimeout(() => setError(""), 5000);
+      showActionError(err, "Failed to accept patient");
+    }
+  }
+
+  async function handleStart(patientId) {
+    if (pendingActionsRef.current.has(String(patientId))) return;
+    try {
+      const row = requireServingPatient(patientId);
+      if (!canManageConsultation) throw new Error("Only the assigned doctor can start this consultation.");
+      if (!isAccepted(row)) throw new Error("Accept the patient before starting consultation.");
+      if (row.consultation_started_at) throw new Error("This consultation has already started.");
+      await performPatientAction(patientId, "start", "/queue/start", { patient_id: patientId }, "Consultation started");
+    } catch (err) {
+      showActionError(err, "Failed to start consultation");
     }
   }
 
   async function handleRecallAnnouncement() {
-    if (recallCooldown) return;
+    if (recallCooldown || (recallPatient && pendingActionsRef.current.has(String(recallPatient.id)))) return;
 
     if (!recallPatient) {
       setError("No accepted patient is currently available to re-call.");
@@ -452,53 +506,36 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
     }, 3000);
 
     try {
-      setError("");
-      const data = await request("/queue/re-call", {
-        method: "POST",
-        body: JSON.stringify({
-          patient_id: recallPatient.id,
-          counterId: doctorName
-        })
-      });
-      if (data?.error) {
-        throw new Error(data.error);
-      }
-      setSuccessMessage(data.message || `Re-call announcement queued for ${recallPatient.queue_number}`);
-      window.setTimeout(() => setSuccessMessage(""), 4000);
+      requireServingPatient(recallPatient.id);
+      await performPatientAction(recallPatient.id, "recall", "/queue/re-call", {
+        patient_id: recallPatient.id,
+        counterId: doctorName
+      }, `Re-call announcement queued for ${recallPatient.queue_number}`);
     } catch (err) {
-      setError(err.message || "Failed to re-call patient");
-      window.setTimeout(() => setError(""), 5000);
+      showActionError(err, "Failed to re-call patient");
     }
   }
 
   async function handleComplete(patientId) {
-    if (Number(patientId) !== Number(activePatientId)) {
-      setError("You can only complete the patient currently being processed.");
-      window.setTimeout(() => setError(""), 4000);
-      return;
-    }
+    if (pendingActionsRef.current.has(String(patientId))) return;
     try {
-      setError("");
-      const data = await request("/queue/complete", { 
-        method: "POST", 
-        body: JSON.stringify({ patient_id: patientId }) 
-      });
-      if (data?.error) {
-        throw new Error(data.error);
+      const row = requireServingPatient(patientId);
+      if (!canManageConsultation) throw new Error("Only the assigned doctor can complete this consultation.");
+      if (!isAccepted(row) || !row.consultation_started_at) {
+        throw new Error("Start the accepted patient's consultation before completing it.");
       }
-      setSuccessMessage(data.message || "Patient completed successfully");
-      window.setTimeout(() => setSuccessMessage(""), 4000);
-      await refreshAll();
+      await performPatientAction(patientId, "complete", "/queue/complete", { patient_id: patientId }, "Consultation completed successfully");
     } catch (err) {
-      setError(err.message || "Failed to complete patient");
-      window.setTimeout(() => setError(""), 5000);
+      showActionError(err, "Failed to complete consultation");
     }
   }
 
   async function handleCancel(patientId) {
-    if (Number(patientId) !== Number(activePatientId)) {
-      setError("You can only cancel the first patient in your queue.");
-      window.setTimeout(() => setError(""), 4000);
+    if (pendingActionsRef.current.has(String(patientId))) return;
+    try {
+      requireServingPatient(patientId);
+    } catch (err) {
+      showActionError(err, "Failed to cancel patient");
       return;
     }
     showConfirmModal({
@@ -507,25 +544,16 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
       showReason: true,
       requireReason: true,
       onConfirm: async (reason) => {
-        const data = await request("/queue/cancel", {
-          method: "POST",
-          body: JSON.stringify({
-            patient_id: patientId,
-            reason,
-            counter_id: doctorName
-          })
-        });
-        if (data?.error) {
-          throw new Error(data.error);
-        }
-        setSuccessMessage(data.message || "Patient cancelled successfully");
-        window.setTimeout(() => setSuccessMessage(""), 4000);
-        await refreshAll();
+        requireServingPatient(patientId);
+        await performPatientAction(patientId, "cancel", "/queue/cancel", {
+          patient_id: patientId, reason, counter_id: doctorName
+        }, "Patient cancelled successfully");
       }
     });
   }
 
   async function handleRequeue(patientId) {
+    if (pendingActionsRef.current.has(String(patientId))) return;
     if (queueSettings.allowQueueReassignment === false) {
       setError("Queue reassignment is disabled in System Settings.");
       window.setTimeout(() => setError(""), 4000);
@@ -537,16 +565,7 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
       showReason: true,
       requireReason: false,
       onConfirm: async (reason) => {
-        const data = await request("/queue/requeue", {
-          method: "POST",
-          body: JSON.stringify({ patient_id: patientId, reason })
-        });
-        if (data?.error) {
-          throw new Error(data.error);
-        }
-        setSuccessMessage(data.message || "Patient re-queued");
-        window.setTimeout(() => setSuccessMessage(""), 4000);
-        await refreshAll();
+        await performPatientAction(patientId, "requeue", "/queue/requeue", { patient_id: patientId, reason }, "Patient re-queued");
       }
     });
   }
@@ -573,6 +592,11 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
         {!doctorIsOnline ? (
           <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
             This doctor counter is offline in System Settings. Calls are blocked until Super Admin enables availability.
+          </div>
+        ) : null}
+        {storageMode === "local_fallback" ? (
+          <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            Development session: consultation records are temporary and will be lost when the backend restarts.
           </div>
         ) : null}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 mb-6">
@@ -645,7 +669,7 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
               <button
                 type="button"
                 onClick={handleRecallAnnouncement}
-                disabled={!recallPatient || recallCooldown}
+                disabled={!recallPatient || recallCooldown || isActionPending(recallPatient?.id)}
                 title={
                   !recallPatient
                     ? "No accepted patient to re-call"
@@ -654,13 +678,13 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
                       : `Re-call ${recallPatient.queue_number}`
                 }
                 className={`px-3 py-1.5 text-white rounded-lg text-sm font-medium transition-colors flex items-center gap-2 ${
-                  !recallPatient || recallCooldown
+                  !recallPatient || recallCooldown || isActionPending(recallPatient?.id)
                     ? "bg-gray-300 cursor-not-allowed"
                     : "bg-amber-600 hover:bg-amber-700"
                 }`}
               >
                 <i className="fas fa-volume-up" />
-                Re-Call
+                {pendingActions[String(recallPatient?.id)] === "recall" ? "Re-Calling..." : "Re-Call"}
               </button>
               <button 
                 onClick={refreshAll}
@@ -745,6 +769,20 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
                         }`}>
                           {row.status}
                         </span>
+                        {row.status === "serving" && (
+                          <div className="mt-2 text-xs brand-text-muted">
+                            {row.consultation_started_at
+                              ? "Consultation in progress"
+                              : isAccepted(row)
+                                ? "Accepted, ready for consultation"
+                                : "Called, awaiting acceptance"}
+                            {row.consultation_started_at && (
+                              <div className="mt-1">
+                                Started: {new Date(row.consultation_started_at).toLocaleString()}
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </td>
                       <td className="px-6 py-4 text-right">
                         <div className="flex justify-end gap-2">
@@ -755,16 +793,19 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
                                 onClick={() => handleAccept(row.id)}
                                 title="Accept patient"
                                 aria-label="Accept patient"
-                                className={`${iconButtonClass} brand-button ring-2 ring-[var(--brand-primary)] animate-pulse`}
+                                disabled={isActionPending(row.id)}
+                                aria-busy={pendingActions[String(row.id)] === "accept"}
+                                className={`${iconButtonClass} brand-button ring-2 ring-[var(--brand-primary)] animate-pulse disabled:opacity-50 disabled:cursor-not-allowed`}
                               >
-                                <i className="fas fa-user-check" />
+                                <i className={pendingActions[String(row.id)] === "accept" ? "fas fa-spinner animate-spin" : "fas fa-user-check"} />
                               </button>
                               <button
                                 type="button"
                                 onClick={() => handleCancel(row.id)}
                                 title="Cancel"
                                 aria-label="Cancel"
-                                className={`${iconButtonClass} bg-red-600 hover:bg-red-700`}
+                                disabled={isActionPending(row.id)}
+                                className={`${iconButtonClass} bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed`}
                               >
                                 <i className="fas fa-times" />
                               </button>
@@ -772,21 +813,39 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
                           )}
                           {row.status === "serving" && canProcessPatient(row) && !row.awaiting_accept && (
                             <>
-                              <button 
-                                type="button"
-                                onClick={() => handleComplete(row.id)}
-                                title="Complete"
-                                aria-label="Complete"
-                                className={`${iconButtonClass} bg-blue-600 hover:bg-blue-700`}
-                              >
-                                <i className="fas fa-check" />
-                              </button>
+                              {isAccepted(row) && canManageConsultation && !row.consultation_started_at && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleStart(row.id)}
+                                  title="Start Consultation"
+                                  disabled={isActionPending(row.id)}
+                                  aria-busy={pendingActions[String(row.id)] === "start"}
+                                  className="inline-flex items-center gap-2 px-3 py-2 brand-button rounded-lg text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                  <i className={pendingActions[String(row.id)] === "start" ? "fas fa-spinner animate-spin" : "fas fa-play"} />
+                                  {pendingActions[String(row.id)] === "start" ? "Starting..." : "Start Consultation"}
+                                </button>
+                              )}
+                              {isAccepted(row) && canManageConsultation && row.consultation_started_at && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleComplete(row.id)}
+                                  title="Complete Consultation"
+                                  disabled={isActionPending(row.id)}
+                                  aria-busy={pendingActions[String(row.id)] === "complete"}
+                                  className="inline-flex items-center gap-2 px-3 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                  <i className={pendingActions[String(row.id)] === "complete" ? "fas fa-spinner animate-spin" : "fas fa-check"} />
+                                  {pendingActions[String(row.id)] === "complete" ? "Completing..." : "Complete Consultation"}
+                                </button>
+                              )}
                               <button 
                                 type="button"
                                 onClick={() => handleCancel(row.id)}
                                 title="Cancel"
                                 aria-label="Cancel"
-                                className={`${iconButtonClass} bg-red-600 hover:bg-red-700`}
+                                disabled={isActionPending(row.id)}
+                                className={`${iconButtonClass} bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed`}
                               >
                                 <i className="fas fa-times" />
                               </button>
@@ -799,7 +858,8 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
                                 onClick={() => handleUndo(row.id)}
                                 title="Undo"
                                 aria-label="Undo"
-                                className={`${iconButtonClass} bg-gray-600 hover:bg-gray-700`}
+                                disabled={isActionPending(row.id)}
+                                className={`${iconButtonClass} bg-gray-600 hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed`}
                               >
                                 <i className="fas fa-undo" />
                               </button>
@@ -809,7 +869,8 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
                                   onClick={() => handleRequeue(row.id)}
                                   title="Re-queue"
                                   aria-label="Re-queue"
-                                  className={`${iconButtonClass} bg-indigo-600 hover:bg-indigo-700`}
+                                  disabled={isActionPending(row.id)}
+                                  className={`${iconButtonClass} bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed`}
                                 >
                                   <i className="fas fa-redo" />
                                 </button>
