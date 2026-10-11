@@ -88,6 +88,29 @@ for (const localFallback of [false, true]) {
     assert.equal((await h.service.getQueueOverview()).counters[0].current_patient_id, patient.id);
   });
 
+  test(`${mode}: a new call after cancellation and re-queue never replays the previous Accept or Re-Call`, async () => {
+    const h = await setup(localFallback);
+    const patient = await acceptedPatient(h);
+    assert.equal((await h.request("POST", "/queue/re-call", { patient_id: patient.id }, doctorUser())).status, 200);
+    assert.equal((await h.service.getDisplayData()).voice_announcements.length, 2);
+    h.advance();
+    assert.equal((await h.request("POST", "/queue/cancel", { patient_id: patient.id, reason: "Patient left" }, doctorUser())).status, 200);
+    assert.equal((await h.service.getDisplayData()).voice_announcements.length, 0);
+    h.advance();
+    assert.equal((await h.request("POST", "/queue/requeue", { patient_id: patient.id }, doctorUser())).status, 200);
+    h.advance();
+    assert.equal((await h.request("POST", "/queue/call", { patient_id: patient.id })).status, 200);
+    assert.equal((await h.service.getDisplayData()).voice_announcements.length, 0,
+      "Calling alone must not expose announcements from the previous call cycle");
+    h.advance();
+    const accepted = await h.request("POST", "/queue/accept", { patient_id: patient.id }, doctorUser());
+    assert.equal(accepted.status, 200);
+    const announcements = (await h.service.getDisplayData()).voice_announcements;
+    assert.equal(announcements.length, 1);
+    assert.equal(announcements[0].announcement_key, accepted.body.announcement_key);
+    assert.equal(h.settings.getVoiceAnnouncementEvents().length, 3, "Persisted audit events remain intact");
+  });
+
   test(`${mode}: called patient must actually be accepted; a submitted acceptance or start timestamp is ignored`, async () => {
     const h = await setup(localFallback);
     const patient = await h.service.createQueueEntry(registration("Not accepted"));

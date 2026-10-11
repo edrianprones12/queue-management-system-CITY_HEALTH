@@ -181,8 +181,15 @@ class TtsState:
                 "success": False,
                 "error": "pyttsx3 is not installed. Run: python -m pip install -r backend/voice/requirements.txt",
             }
-        if self.dry_run or self.engine is not None:
+        if self.dry_run:
             return {"success": True}
+
+        with self.lock:
+            # Resetting SAPI temporarily clears the engine between utterances.
+            # A healthy worker that is already handling speech must not queue a
+            # warm-up behind that speech and report a false readiness timeout.
+            if self.engine is not None or self.speaking_key or self.pending:
+                return {"success": True}
 
         log_event("warm-up-queued", timeout_seconds=timeout_seconds)
         done_event = threading.Event()

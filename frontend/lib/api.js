@@ -1,4 +1,5 @@
 export const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://127.0.0.1:4000/api";
+export const AUTH_SESSION_CHANGED_EVENT = "city-health-auth-session-changed";
 
 export async function request(path, options = {}) {
   const url = `${API_BASE_URL}${path}`;
@@ -55,6 +56,16 @@ export async function request(path, options = {}) {
     if (!response.ok) {
       console.error(`API Error: ${response.status} ${response.statusText} for ${path}`, data);
       const errorMsg = data?.message || data?.error || `Request failed with status ${response.status}`;
+      const invalidSession = response.status === 401 ||
+        (response.status === 403 && errorMsg === "Invalid or expired token");
+      // Do not let an older request sign out a newly logged-in account. A
+      // permission denial for a valid account must also keep its session.
+      if (token && path !== "/auth/login" && invalidSession &&
+          localStorage.getItem("city_health_token") === token) {
+        localStorage.removeItem("city_health_token");
+        localStorage.removeItem("city_health_user");
+        window.dispatchEvent(new Event(AUTH_SESSION_CHANGED_EVENT));
+      }
       // Return error object instead of throwing, so UI can handle gracefully
       return { error: errorMsg };
     }

@@ -30,9 +30,13 @@ If your terminal is already inside `backend/`, run `npm.cmd run dev` there; use 
 
 Backend startup seeds only missing doctor counters. Existing counter IDs, availability and active patient assignments are preserved across restarts; Supabase consultations can resume using their saved start time and the existing acceptance file.
 
+The backend loads `backend/.env` regardless of its launch directory. When Supabase is configured, a database outage reports an error and subsequent requests retry the database; it does not replace saved patients with an empty local queue. Temporary in-memory development storage is used only when Supabase is unconfigured.
+
+To test Frontdesk, Doctor and Superadmin simultaneously, use different browsers or separate browser profiles. Tabs in one browser profile share a login and update their displayed account together. An expired login returns protected pages to sign-in instead of leaving them polling with an invalid token.
+
 ## Run the pyttsx3 voice announcer on Windows
 
-Run the Python voice service on the **same computer and logged-in Windows desktop session as the Queue Display and its speakers**. The backend, frontend, and voice service are three separate processes. Python produces the spoken announcement; the browser plays an optional soft, descending two-note cabin chime before speech. **Sound Notifications** controls the chime. If browser audio is blocked, toggle Queue Display voice off and back on, then use **Re-Call** for an accepted patient to hear it.
+Run the Python voice service on the **same computer and logged-in Windows desktop session as the Queue Display and its speakers**. The backend, frontend, and voice service are three separate processes. Python produces the spoken announcement; the browser plays a slower, descending ding-dong bell before speech. **Sound Notifications** controls the bell. After opening or refreshing Queue Display, click **Enable Bell** if it appears; the click enables browser sound and plays the bell once as a test. Use **Re-Call** for an accepted patient to verify the bell followed by voice.
 
 ### 1. Open PowerShell in the project root
 

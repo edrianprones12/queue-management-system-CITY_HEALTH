@@ -7,7 +7,7 @@ import SystemLogo from "../components/SystemLogo";
 const ANNOUNCE_GAP_MS_DEFAULT = 3000;
 const DISPLAY_POLL_MS = 1500;
 const PYTTSX3_TTS_BASE_URL = (process.env.NEXT_PUBLIC_PYTTSX3_TTS_URL || "http://127.0.0.1:8765").replace(/\/+$/, "");
-const PYTTSX3_HEALTH_TIMEOUT_MS = 2500;
+const PYTTSX3_HEALTH_TIMEOUT_MS = 6500;
 const PYTTSX3_SPEAK_TIMEOUT_MS = 45000;
 const PYTTSX3_RETRY_MS = 5000;
 const TTS_DEBUG = process.env.NEXT_PUBLIC_TTS_DEBUG !== "0";
@@ -59,12 +59,12 @@ function playCabinChime(ctx) {
 
     try {
       const start = ctx.currentTime + 0.02;
+      // A slower descending ding-dong, with each note ringing out naturally.
       const noteDuration = 1.2;
       const noteSpacing = 0.8;
-      // Balance the higher ding and lower dong with separate volume levels.
       const notes = [
-        { frequency: 880, peakGain: 0.20 },
-        { frequency: 660, peakGain: 0.24 }
+        { frequency: 880, peakGain: 0.30 },
+        { frequency: 660, peakGain: 0.34 }
       ];
       notes.forEach(({ frequency, peakGain }, index) => {
         const at = start + index * noteSpacing;
@@ -169,6 +169,7 @@ export default function QueueDisplayPage() {
   const [mounted, setMounted] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const [bellReady, setBellReady] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState("Listening for doctor calls via pyttsx3...");
   const [display, setDisplay] = useState({
     settings: {
@@ -190,6 +191,8 @@ export default function QueueDisplayPage() {
   const announcedKeysRef = useRef(new Set());
   const queuedKeysRef = useRef(new Set());
   const isProcessingRef = useRef(false);
+  const activeAnnouncementKeyRef = useRef(null);
+  const playbackGenerationRef = useRef(0);
   const voiceEnabledRef = useRef(true);
   const seededRef = useRef(false);
   const displayStartedAtRef = useRef(Date.now());
@@ -220,9 +223,7 @@ export default function QueueDisplayPage() {
   useEffect(() => {
     voiceEnabledRef.current = voiceEnabled;
     if (!voiceEnabled) {
-      announcementQueueRef.current = [];
-      queuedKeysRef.current = new Set();
-      isProcessingRef.current = false;
+      pauseAnnouncementQueue();
       setIsSpeaking(false);
     }
   }, [voiceEnabled]);
@@ -246,24 +247,31 @@ export default function QueueDisplayPage() {
     });
   }
 
-  function unlockAudioFromUserGesture() {
-    if (typeof window === "undefined") return;
+  async function unlockAudioFromUserGesture() {
+    if (typeof window === "undefined") return null;
 
     // Resume inside the click gesture; the chime plays with the next announcement.
     try {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (Ctx) {
         if (!audioCtxRef.current) audioCtxRef.current = new Ctx();
-        if (audioCtxRef.current.state === "suspended") {
-          audioCtxRef.current.resume().catch(() => {});
-        }
+        const ctx = audioCtxRef.current;
+        if (ctx.state === "suspended") await ctx.resume();
+        setBellReady(ctx.state === "running");
+        return ctx.state === "running" ? ctx : null;
       }
     } catch (_e) {
-      // ignore
+      setBellReady(false);
     }
 
     // Voice itself is handled by the local pyttsx3 service. The browser only
-    // plays the optional cabin chime, so SpeechSynthesis never overlaps with pyttsx3.
+    // plays the optional bell, so SpeechSynthesis never overlaps with pyttsx3.
+    return null;
+  }
+
+  async function enableBell() {
+    const ctx = await unlockAudioFromUserGesture();
+    if (ctx && !isSpeaking) await playCabinChime(ctx);
   }
 
   async function checkPyttsx3Service({ initialize = false } = {}) {
@@ -323,12 +331,20 @@ export default function QueueDisplayPage() {
 
   function disableVoiceAnnouncer() {
     voiceEnabledRef.current = false;
-    announcementQueueRef.current = [];
-    queuedKeysRef.current = new Set();
-    isProcessingRef.current = false;
+    pauseAnnouncementQueue();
     setVoiceEnabled(false);
     setVoiceStatus("Voice announcements paused on this display.");
     setIsSpeaking(false);
+  }
+
+  function pauseAnnouncementQueue() {
+    playbackGenerationRef.current += 1;
+    announcementQueueRef.current = [];
+    // The in-flight processor still owns its key until its await finishes.
+    // Retain that ownership so a quick re-enable cannot start another worker.
+    queuedKeysRef.current = new Set(
+      activeAnnouncementKeyRef.current ? [activeAnnouncementKeyRef.current] : []
+    );
   }
 
   function enqueueNewCalls(candidatePatients) {
@@ -345,6 +361,11 @@ export default function QueueDisplayPage() {
     for (const patient of candidatePatients || []) {
       const key = getAnnouncementKey(patient);
       if (!key) continue;
+      const eventAtMs = new Date(patient.announcement_at || patient.accepted_at).getTime();
+      if (eventAtMs < displayStartedAtRef.current) {
+        announcedKeysRef.current.add(key);
+        continue;
+      }
       if (announcedKeysRef.current.has(key)) {
         logTts("candidate-skipped-already-announced", { key, queueNumber: patient.queue_number });
         continue;
@@ -409,6 +430,7 @@ export default function QueueDisplayPage() {
     while (voiceEnabledRef.current && announcementQueueRef.current.length > 0) {
       const next = announcementQueueRef.current.shift();
       if (!next?.patient) continue;
+      activeAnnouncementKeyRef.current = next.key;
 
       try {
         logTts("process-next", {
@@ -417,10 +439,10 @@ export default function QueueDisplayPage() {
           doctorName: next.patient.counter_name,
           room: next.patient.room
         });
-        await speakPatientAnnouncement(next.patient);
-        announcedKeysRef.current.add(next.key);
+        const spoken = await speakPatientAnnouncement(next.patient);
+        if (spoken) announcedKeysRef.current.add(next.key);
         queuedKeysRef.current.delete(next.key);
-        logTts("process-spoken", { key: next.key, queueNumber: next.patient.queue_number });
+        logTts(spoken ? "process-spoken" : "process-paused", { key: next.key, queueNumber: next.patient.queue_number });
       } catch (err) {
         console.error("Announcement failed:", err);
         logTts("process-error", {
@@ -440,6 +462,11 @@ export default function QueueDisplayPage() {
         setVoiceStatus(`pyttsx3 unavailable: ${err.message || "playback failed"}; retrying...`);
         await delay(PYTTSX3_RETRY_MS);
         continue;
+      } finally {
+        activeAnnouncementKeyRef.current = null;
+        if (!announcementQueueRef.current.some((item) => item.key === next.key)) {
+          queuedKeysRef.current.delete(next.key);
+        }
       }
 
       if (voiceEnabledRef.current && announcementQueueRef.current.length > 0) {
@@ -472,6 +499,8 @@ export default function QueueDisplayPage() {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!Ctx) return Promise.resolve();
       if (!audioCtxRef.current) audioCtxRef.current = new Ctx();
+      setBellReady(audioCtxRef.current.state === "running");
+      logTts("bell-playback", { state: audioCtxRef.current.state });
       return playCabinChime(audioCtxRef.current);
     } catch (_e) {
       return Promise.resolve();
@@ -514,20 +543,25 @@ export default function QueueDisplayPage() {
   }
 
   async function speakPatientAnnouncement(patient) {
+    const generation = playbackGenerationRef.current;
     setIsSpeaking(true);
     setVoiceStatus(`Announcing ${patient.queue_number || "patient"}…`);
 
     try {
       await checkPyttsx3Service({ initialize: true });
+      if (!voiceEnabledRef.current || generation !== playbackGenerationRef.current) {
+        setIsSpeaking(false);
+        return false;
+      }
       await playNotificationBell();
     } catch (_e) {
       setIsSpeaking(false);
       throw _e;
     }
 
-    if (!voiceEnabledRef.current) {
+    if (!voiceEnabledRef.current || generation !== playbackGenerationRef.current) {
       setIsSpeaking(false);
-      return;
+      return false;
     }
 
     const queueNumber = patient.queue_number || "";
@@ -561,6 +595,7 @@ export default function QueueDisplayPage() {
       if (result?.duplicate) {
         setVoiceStatus(`${queueNumber || "Patient"} is already queued in pyttsx3`);
       }
+      return true;
     } finally {
       setIsSpeaking(false);
     }
@@ -682,6 +717,18 @@ export default function QueueDisplayPage() {
               <i className={`fas ${voiceEnabled ? "fa-volume-up" : "fa-volume-mute"}`} />
               {voiceEnabled ? (isSpeaking ? "Announcing…" : "Voice Enabled") : "Voice Disabled"}
             </button>
+            {mounted && soundNotificationsAllowed() && !bellReady ? (
+              <button
+                type="button"
+                onClick={enableBell}
+                disabled={isSpeaking}
+                className="flex items-center gap-2 px-3 py-1 rounded-lg text-xs font-bold border border-white/30 text-white hover:bg-white/10 disabled:opacity-50"
+                title="Click once after opening or refreshing this display to enable and test the bell."
+              >
+                <i className="fas fa-bell" />
+                Enable Bell
+              </button>
+            ) : null}
             {voiceStatus ? (
               <span className="text-[9px] text-white/60 font-bold uppercase tracking-wider max-w-[220px] text-right truncate">
                 {voiceStatus}

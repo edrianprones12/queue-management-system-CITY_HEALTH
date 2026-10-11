@@ -233,6 +233,7 @@ function createHarness(options = {}) {
   if (options.rpc) supabase.rpc = options.rpc;
   const service = loadModule("src/services/queueService.js", {
     "../lib/supabase": supabase,
+    "../config/env": options.localFallback ? {} : { supabaseUrl: "https://isolated-test.invalid", supabaseServiceRoleKey: "isolated-test-key" },
     bcryptjs: {},
     "./notificationService": {
       sendQueueCreatedNotification: (...args) => notifications.push({ type: "created", args }),

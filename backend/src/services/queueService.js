@@ -1,4 +1,5 @@
 const supabase = require("../lib/supabase");
+const env = require("../config/env");
 const bcrypt = require("bcryptjs");
 const {
   sendQueueCreatedNotification,
@@ -51,6 +52,23 @@ const localData = {
 // Helper to check if Supabase is connected
 let useLocalFallback = false;
 
+const supabaseConfigured = Boolean(env.supabaseUrl && env.supabaseServiceRoleKey);
+
+function enableLocalFallback(error) {
+  // A configured database remains the source of truth during an outage. Empty
+  // development memory would hide its patients and allow conflicting writes.
+  if (supabaseConfigured) {
+    if (error?.statusCode === 503) throw error;
+    console.warn("Queue database unavailable:", error?.message || "Unknown database failure");
+    const unavailable = new Error("The queue database is unavailable. Please retry after the backend connection is restored.");
+    unavailable.statusCode = 503;
+    unavailable.cause = error;
+    throw unavailable;
+  }
+  console.warn("Supabase is not configured; using temporary development memory.");
+  useLocalFallback = true;
+}
+
 function getQueueStorageMode() {
   return useLocalFallback ? "local_fallback" : "supabase";
 }
@@ -96,15 +114,13 @@ async function getDisplaySettings() {
       .maybeSingle();
 
     if (error) {
-      console.warn("Supabase unreachable, using local fallback");
-      useLocalFallback = true;
+      enableLocalFallback(error);
       return localData.displaySettings;
     }
 
     return data || localData.displaySettings;
   } catch (err) {
-    console.warn("Supabase error, using local fallback:", err.message);
-    useLocalFallback = true;
+    enableLocalFallback(err);
     return localData.displaySettings;
   }
 }
@@ -129,8 +145,7 @@ async function getCounters() {
       .limit(3);
 
     if (error) {
-      console.warn("Supabase unreachable, using local fallback");
-      useLocalFallback = true;
+      enableLocalFallback(error);
       return getCounters();
     }
 
@@ -160,8 +175,7 @@ async function getCounters() {
       current_patient_queue_number: patientMap[counter.current_patient_id]?.queue_number || null
     }));
   } catch (err) {
-    console.warn("Supabase error, using local fallback:", err.message);
-    useLocalFallback = true;
+    enableLocalFallback(err);
     return getCounters();
   }
 }
@@ -235,15 +249,13 @@ async function getTodayPatients() {
       .order("created_at", { ascending: true });
 
     if (error) {
-      console.warn("Supabase unreachable, using local fallback");
-      useLocalFallback = true;
+      enableLocalFallback(error);
       return getTodayPatients();
     }
 
     return (data || []).map(parsePatientPriority);
   } catch (err) {
-    console.warn("Supabase error, using local fallback:", err.message);
-    useLocalFallback = true;
+    enableLocalFallback(err);
     return getTodayPatients();
   }
 }
@@ -453,14 +465,19 @@ async function createQueueEntry({ idNum, serviceType, mobileNumber, residency, p
         throw formatError(error, "Failed to create queue entry");
       }
 
-      const stats = await getQueueStats();
-      sendQueueCreatedNotification(mobileNumber, queueNumber, serviceType, Math.max(0, stats.waiting - 1));
+      // The registration is already committed. A failed statistics read must
+      // not cause an apparent registration failure or a second local insert.
+      try {
+        const stats = await getQueueStats();
+        sendQueueCreatedNotification(mobileNumber, queueNumber, serviceType, Math.max(0, stats.waiting - 1));
+      } catch (notificationError) {
+        console.warn("Queue entry saved; creation notification could not be prepared:", notificationError.message);
+      }
 
       return { ...data, priority_score: priorityScore, vulnerability_flags: vulnerabilityFlags };
     } catch (err) {
       if (err.message?.includes("Supabase") || err.message?.includes("fetch failed")) {
-        console.warn("Supabase error, switching to local fallback");
-        useLocalFallback = true;
+        enableLocalFallback(err);
         return createQueueEntry({ idNum, serviceType, mobileNumber, residency, philhealthId, birthdate, sex, source, vulnerabilityFlags });
       }
       
@@ -518,15 +535,13 @@ async function getPatientById(id) {
       .maybeSingle();
 
     if (error) {
-      console.warn("Supabase unreachable, using local fallback");
-      useLocalFallback = true;
+      enableLocalFallback(error);
       return getPatientById(id);
     }
 
     return data;
   } catch (err) {
-    console.warn("Supabase error, using local fallback:", err.message);
-    useLocalFallback = true;
+    enableLocalFallback(err);
     return getPatientById(id);
   }
 }
@@ -556,8 +571,7 @@ async function clearCounterAssignment(patientId) {
 
     return data;
   } catch (err) {
-    console.warn("Supabase error, using local fallback:", err.message);
-    useLocalFallback = true;
+    enableLocalFallback(err);
     return clearCounterAssignment(patientId);
   }
 }
@@ -1431,6 +1445,12 @@ async function getDisplayData() {
     .map((event) => {
       const patient = patientById.get(Number(event.patient_id));
       if (!patient || patient.status !== "serving") return null;
+      // Re-queue keeps the patient ID, but a later call is a new announcement
+      // cycle. Do not attach a previous Accept/Re-Call to the current visit.
+      const calledAt = timestampMicroseconds(patient.called_at);
+      const eventCalledAt = timestampMicroseconds(event.called_at);
+      const eventAt = timestampMicroseconds(event.event_at);
+      if (calledAt == null || eventCalledAt !== calledAt || eventAt == null || eventAt < calledAt) return null;
       return {
         id: patient.id,
         queue_number: patient.queue_number || event.queue_number,
@@ -1688,17 +1708,16 @@ async function loginUser(id_num, password) {
       .maybeSingle();
 
     if (error) {
-      console.warn("Supabase error, switching to local fallback:", error.message);
-      useLocalFallback = true;
+      enableLocalFallback(error);
       return loginUser(id_num, password);
     }
     
     if (!data) {
       console.log("User not found for id_num:", id_num);
       // Check if it's the frontdesk user, if not found, add it locally
-      if (id_num === "frontdesk") {
+      if (id_num === "frontdesk" && !supabaseConfigured) {
         console.log("Adding frontdesk user to local fallback");
-        useLocalFallback = true;
+        enableLocalFallback();
         return loginUser(id_num, password);
       }
       throw new Error("Invalid username or password");
@@ -1735,8 +1754,7 @@ async function loginUser(id_num, password) {
     };
   } catch (err) {
     if (err.message?.includes("Supabase") || err.message?.includes("fetch failed")) {
-      console.warn("Supabase unreachable, using local fallback");
-      useLocalFallback = true;
+      enableLocalFallback(err);
       return loginUser(id_num, password);
     }
     throw err;
@@ -1760,15 +1778,13 @@ async function getUsers() {
       .order("created_at", { ascending: false });
 
     if (error) {
-      console.warn("Supabase unreachable, using local fallback");
-      useLocalFallback = true;
+      enableLocalFallback(error);
       return getUsers();
     }
 
     return data || [];
   } catch (err) {
-    console.warn("Supabase error, using local fallback:", err.message);
-    useLocalFallback = true;
+    enableLocalFallback(err);
     return getUsers();
   }
 }

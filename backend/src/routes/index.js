@@ -90,7 +90,7 @@ router.post("/auth/login", async (req, res) => {
 
     res.json({ success: true, token, user });
   } catch (error) {
-    res.status(401).json({ success: false, message: error.message });
+    res.status(error.statusCode || 401).json({ success: false, message: error.message });
   }
 });
 
@@ -99,7 +99,7 @@ router.get("/queue", authenticateToken, async (_req, res) => {
     const data = await getQueueOverview();
     res.json({ success: true, ...data });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
   }
 });
 
@@ -187,7 +187,7 @@ router.post("/queue/call", authenticateToken, async (req, res) => {
     });
     res.json({ success: true, message: "Patient called successfully" });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.statusCode || 400).json({ success: false, message: error.message });
   }
 });
 
@@ -311,7 +311,7 @@ router.post("/queue/cancel", authenticateToken, async (req, res) => {
     clearAwaitingAccept(patient_id);
     res.json({ success: true, message: "Patient cancelled successfully" });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.statusCode || 400).json({ success: false, message: error.message });
   }
 });
 
@@ -321,7 +321,7 @@ router.post("/queue/no-show", authenticateToken, async (req, res) => {
     await noShowPatient(Number(patient_id), reason);
     res.json({ success: true, message: "Patient marked as no-show" });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.statusCode || 400).json({ success: false, message: error.message });
   }
 });
 
@@ -335,7 +335,7 @@ router.post("/queue/recall", authenticateToken, async (req, res) => {
       ...result
     });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.statusCode || 400).json({ success: false, message: error.message });
   }
 });
 
@@ -346,7 +346,7 @@ router.post("/queue/requeue", authenticateToken, async (req, res) => {
     resetAcceptState(patient_id);
     res.json({ success: true, message: "Patient re-queued successfully" });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.statusCode || 400).json({ success: false, message: error.message });
   }
 });
 
@@ -357,7 +357,7 @@ router.post("/queue/undo", authenticateToken, async (req, res) => {
     resetAcceptState(patient_id);
     res.json({ success: true, message: "Action undone successfully" });
   } catch (error) {
-    res.status(400).json({ success: false, message: error.message });
+    res.status(error.statusCode || 400).json({ success: false, message: error.message });
   }
 });
 
@@ -434,7 +434,7 @@ router.get("/stats", async (_req, res) => {
     const data = await getQueueStats();
     res.json({ success: true, data });
   } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
   }
 });
 
@@ -443,7 +443,7 @@ router.get("/display", async (_req, res) => {
     const data = await getDisplayData();
     res.json(data);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(error.statusCode || 500).json({ success: false, message: error.message });
   }
 });
 

@@ -18,13 +18,58 @@ function sourceSection(start, end) {
 
 const displayFunctions = [
   sourceSection("function getStoredAnnounceGapMs()", "async function fetchJsonWithTimeout("),
-  sourceSection("  function seedKnownCalls(", "  function unlockAudioFromUserGesture("),
+  sourceSection("  function seedKnownCalls(", "  async function unlockAudioFromUserGesture("),
+  sourceSection("  function disableVoiceAnnouncer(", "  function enqueueNewCalls("),
   sourceSection("  function enqueueNewCalls(", "  function delay("),
   sourceSection("  function sendPyttsx3Announcement(", "  const matchesDoctor ="),
   sourceSection("  async function loadDisplay(", "  const formatTime =")
 ].join("\n");
 
-function createDisplayHarness({ enabled = true, settings = {}, speak = null, bell = null } = {}) {
+function bellUnlockHarness({ blocked = false, speaking = false } = {}) {
+  const audioCtxRef = { current: null };
+  let ready = false, previews = 0, resumes = 0;
+  class BrowserAudio {
+    constructor() { this.state = "suspended"; }
+    async resume() {
+      resumes += 1;
+      if (blocked) throw new Error("Browser audio is blocked");
+      this.state = "running";
+    }
+  }
+  const context = vm.createContext({
+    window: { AudioContext: BrowserAudio }, audioCtxRef, isSpeaking: speaking,
+    setBellReady(value) { ready = value; },
+    async playCabinChime(ctx) { assert.equal(ctx.state, "running"); previews += 1; }
+  });
+  vm.runInContext(sourceSection("  async function unlockAudioFromUserGesture(", "  async function checkPyttsx3Service(") +
+    "\nthis.audioApi = { enableBell, unlockAudioFromUserGesture };", context);
+  return { api: context.audioApi, audioCtxRef, get ready() { return ready; },
+    get previews() { return previews; }, get resumes() { return resumes; } };
+}
+
+test("Enable Bell resumes browser audio and previews the bell without requesting speech", async () => {
+  const h = bellUnlockHarness();
+  await h.api.enableBell();
+  assert.equal(h.ready, true);
+  assert.equal(h.resumes, 1);
+  assert.equal(h.previews, 1);
+});
+
+test("a rejected browser audio unlock keeps the bell unavailable without failing voice controls", async () => {
+  const h = bellUnlockHarness({ blocked: true });
+  await h.api.enableBell();
+  assert.equal(h.ready, false);
+  assert.equal(h.previews, 0);
+});
+
+test("unlocking browser audio during speech does not preview a bell over the announcement", async () => {
+  const h = bellUnlockHarness({ speaking: true });
+  await h.api.enableBell();
+  assert.equal(h.ready, true);
+  assert.equal(h.previews, 0);
+});
+
+function createDisplayHarness({ enabled = true, settings = {}, speak = null, bell = null, delay = null } = {}) {
   const speech = [];
   let response = {};
   const refs = {
@@ -34,6 +79,8 @@ function createDisplayHarness({ enabled = true, settings = {}, speak = null, bel
     queuedKeysRef: { current: new Set() },
     announcementQueueRef: { current: [] },
     isProcessingRef: { current: false },
+    activeAnnouncementKeyRef: { current: null },
+    playbackGenerationRef: { current: 0 },
     displayRef: { current: {} },
     displayStartedAtRef: { current: Date.parse("2026-10-10T01:00:30.000Z") }
   };
@@ -69,11 +116,11 @@ function createDisplayHarness({ enabled = true, settings = {}, speak = null, bel
       speech.push(payload);
       return { success: true, key: payload.key };
     },
-    async delay() {},
+    async delay(ms) { if (delay) await delay(ms); },
     console: { error() {}, info() {} }
   });
   vm.runInContext(`${displayFunctions}\nthis.displayApi = {
-    seedKnownCalls, loadDisplay, collectCallCandidates, getAnnouncementKey
+    seedKnownCalls, loadDisplay, collectCallCandidates, getAnnouncementKey, disableVoiceAnnouncer
   };`, context, { filename: "queue-display-voice-functions.js" });
 
   return {
@@ -81,6 +128,10 @@ function createDisplayHarness({ enabled = true, settings = {}, speak = null, bel
     refs,
     api: context.displayApi,
     seed(data = {}) { context.displayApi.seedKnownCalls(data); },
+    async load(data) {
+      response = data;
+      await context.displayApi.loadDisplay();
+    },
     async poll(data) {
       response = data;
       await context.displayApi.loadDisplay();
@@ -303,4 +354,160 @@ test("polling an event while its pyttsx3 request is pending does not queue it tw
   await harness.poll({ voice_announcements: [calledPatient({ accepted_at: "2026-10-10T01:01:00.000Z", announcement_key: "pending-event" })] });
   assert.equal(harness.speech.length, 1);
   assert.equal(harness.refs.queuedKeysRef.current.size, 0);
+});
+
+test("pausing during the bell does not consume an unspoken announcement", async () => {
+  let releaseBell;
+  let bellStarted;
+  let calls = 0;
+  const bellReady = new Promise((resolve) => { bellStarted = resolve; });
+  const bellFinished = new Promise((resolve) => { releaseBell = resolve; });
+  const harness = createDisplayHarness({ bell() {
+    calls += 1;
+    if (calls === 1) {
+      bellStarted();
+      return bellFinished;
+    }
+  } });
+  harness.seed();
+  const data = { voice_announcements: [calledPatient({
+    accepted_at: "2026-10-10T01:01:00.000Z", announcement_key: "pause-during-bell"
+  })] };
+  await harness.load(data);
+  await bellReady;
+  harness.api.disableVoiceAnnouncer();
+  assert.equal(harness.refs.isProcessingRef.current, true);
+  releaseBell();
+  await harness.poll(data);
+  assert.equal(harness.speech.length, 0);
+  assert.equal(harness.refs.announcedKeysRef.current.has("pause-during-bell"), false);
+  harness.refs.voiceEnabledRef.current = true;
+  await harness.poll(data);
+  assert.equal(harness.speech.length, 1);
+});
+
+test("quick pause and resume keep one processor until its pending speech finishes", async () => {
+  let releaseSpeech;
+  let speechStarted;
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let attempts = 0;
+  const firstStarted = new Promise((resolve) => { speechStarted = resolve; });
+  const firstFinished = new Promise((resolve) => { releaseSpeech = resolve; });
+  const harness = createDisplayHarness({ async speak() {
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    attempts += 1;
+    if (attempts === 1) {
+      speechStarted();
+      await firstFinished;
+    }
+    inFlight -= 1;
+  } });
+  harness.seed();
+  const accepted = calledPatient({ accepted_at: "2026-10-10T01:01:00.000Z", announcement_key: "active-speech" });
+  await harness.load({ voice_announcements: [accepted] });
+  await firstStarted;
+  harness.api.disableVoiceAnnouncer();
+  harness.refs.voiceEnabledRef.current = true;
+  const recalled = { ...accepted, announcement_key: "next-speech", announcement_at: "2026-10-10T01:02:00.000Z" };
+  await harness.load({ voice_announcements: [accepted, recalled] });
+  assert.equal(attempts, 1, "Resuming must not start a second processor");
+  releaseSpeech();
+  await harness.poll({ voice_announcements: [accepted, recalled] });
+  assert.equal(maxInFlight, 1);
+  assert.deepEqual(harness.speech.map((payload) => payload.key), ["active-speech", "next-speech"]);
+});
+
+test("historical events that appear after the first poll are not replayed", async () => {
+  const harness = createDisplayHarness();
+  await harness.poll({ voice_announcements: [] });
+  await harness.poll({ voice_announcements: [calledPatient({
+    accepted_at: "2026-10-10T01:00:00.000Z", announcement_key: "late-history"
+  })] });
+  assert.equal(harness.speech.length, 0);
+});
+
+test("pausing during a retry delay releases the abandoned queue key", async () => {
+  let releaseRetry;
+  let retryStarted;
+  let attempts = 0;
+  const retryReady = new Promise((resolve) => { retryStarted = resolve; });
+  const retryFinished = new Promise((resolve) => { releaseRetry = resolve; });
+  const harness = createDisplayHarness({
+    speak() {
+      attempts += 1;
+      if (attempts === 1) throw new Error("Synthetic TTS failure");
+    },
+    delay() { retryStarted(); return retryFinished; }
+  });
+  harness.seed();
+  const data = { voice_announcements: [calledPatient({
+    accepted_at: "2026-10-10T01:01:00.000Z", announcement_key: "paused-retry"
+  })] };
+  await harness.load(data);
+  await retryReady;
+  harness.api.disableVoiceAnnouncer();
+  harness.refs.voiceEnabledRef.current = true;
+  releaseRetry();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(harness.refs.queuedKeysRef.current.has("paused-retry"), false);
+  await harness.poll(data);
+  assert.equal(attempts, 2);
+  assert.equal(harness.speech.length, 1);
+});
+
+test("the slower descending ding-dong rings both notes before speech can begin", async () => {
+  const oscillators = [];
+  const gains = [];
+  let timer;
+  let timerMs;
+  const context = vm.createContext({
+    clearTimeout() {},
+    setTimeout(callback, ms) { timer = callback; timerMs = ms; return 1; }
+  });
+  vm.runInContext(sourceSection("function playCabinChime(", "function formatQueueForSpeech("), context);
+  const ctx = {
+    state: "running", currentTime: 10, destination: {},
+    createOscillator() {
+      const osc = {
+        frequencyEvents: [], stops: [],
+        frequency: { setValueAtTime(value, at) { osc.frequencyEvents.push([value, at]); } },
+        connect(gain) { return gain; },
+        start(at) { osc.started = at; },
+        stop(at) { osc.stops.push(at); },
+        disconnect() {}
+      };
+      oscillators.push(osc);
+      return osc;
+    },
+    createGain() {
+      const gain = {
+        events: [],
+        gain: {
+          setValueAtTime(value, at) { gain.events.push(["set", value, at]); },
+          linearRampToValueAtTime(value, at) { gain.events.push(["ramp", value, at]); },
+          exponentialRampToValueAtTime(value, at) { gain.events.push(["decay", value, at]); }
+        },
+        connect() {}, disconnect() {}
+      };
+      gains.push(gain);
+      return gain;
+    }
+  };
+  let finished = false;
+  const playback = context.playCabinChime(ctx).then(() => { finished = true; });
+  assert.equal(Math.round(timerMs), 2320);
+  assert.equal(finished, false);
+  const milliseconds = (at) => Math.round((at - ctx.currentTime) * 1000);
+  assert.deepEqual(oscillators.map(osc => osc.frequencyEvents.map(([frequency, at]) => [frequency, milliseconds(at)])),
+    [[[880, 20]], [[660, 820]]]);
+  assert.deepEqual(oscillators.map(osc => milliseconds(osc.stops[0])), [1220, 2020]);
+  assert.deepEqual(gains.map(gain => gain.events.map(([kind, value, at]) => [kind, Number(value.toFixed(6)), milliseconds(at)])), [
+    [["set", 0, 20], ["ramp", 0.30, 35], ["decay", 0.00015, 1200], ["ramp", 0, 1220]],
+    [["set", 0, 820], ["ramp", 0.34, 835], ["decay", 0.00017, 2000], ["ramp", 0, 2020]]
+  ]);
+  oscillators[1].onended();
+  await playback;
+  assert.equal(finished, true);
 });

@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect } from "react";
 import { useRouter } from "next/router";
-import { request } from "../lib/api";
+import { AUTH_SESSION_CHANGED_EVENT, request } from "../lib/api";
 
 const AuthContext = createContext(null);
 
@@ -10,18 +10,43 @@ export function AuthProvider({ children }) {
   const router = useRouter();
 
   useEffect(() => {
-    // Wait for hydration to access localStorage
-    const storedUser = localStorage.getItem("city_health_user");
-    const token = localStorage.getItem("city_health_token");
-    if (storedUser && token) {
-      try {
-        setUser(JSON.parse(storedUser));
-      } catch (e) {
-        localStorage.removeItem("city_health_user");
-        localStorage.removeItem("city_health_token");
+    function synchronizeSession() {
+      const storedUser = localStorage.getItem("city_health_user");
+      const token = localStorage.getItem("city_health_token");
+      if (storedUser && token) {
+        try {
+          const savedUser = JSON.parse(storedUser);
+          if (!savedUser || typeof savedUser !== "object" || !savedUser.id_num) {
+            throw new Error("Invalid saved user");
+          }
+          setUser(savedUser);
+        } catch (_error) {
+          localStorage.removeItem("city_health_user");
+          localStorage.removeItem("city_health_token");
+          setUser(null);
+        }
+      } else {
+        setUser(null);
+      }
+      setLoading(false);
+    }
+
+    function handleStorageChange(event) {
+      if (event.storageArea && event.storageArea !== localStorage) return;
+      if (event.key === null || event.key === "city_health_user" || event.key === "city_health_token") {
+        synchronizeSession();
       }
     }
-    setLoading(false);
+
+    // Other tabs share the token used by request(), so their displayed user must
+    // follow it too. API authentication failures notify this tab separately.
+    window.addEventListener("storage", handleStorageChange);
+    window.addEventListener(AUTH_SESSION_CHANGED_EVENT, synchronizeSession);
+    synchronizeSession();
+    return () => {
+      window.removeEventListener("storage", handleStorageChange);
+      window.removeEventListener(AUTH_SESSION_CHANGED_EVENT, synchronizeSession);
+    };
   }, []);
 
   const login = async (id_num, password) => {

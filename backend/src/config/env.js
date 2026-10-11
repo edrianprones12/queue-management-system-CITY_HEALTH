@@ -1,7 +1,9 @@
 const path = require("path");
 const dotenv = require("dotenv");
 
-dotenv.config({ path: path.resolve(process.cwd(), ".env") });
+// The backend may be started from the repository root or the backend folder.
+// Always load this service's configuration instead of the caller's directory.
+dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
 const env = {
   port: Number(process.env.PORT || 4000),
