@@ -6,6 +6,13 @@ import SiteFrame from "../components/SiteFrame";
 import SettingsModal, { defaultQueueSettings } from "../components/SettingsModal";
 import { request } from "../lib/api";
 import {
+  captureDoctorPresence,
+  doctorPresenceStatus,
+  presenceClock,
+  DOCTOR_NAMES,
+  PRESENCE_REFRESH_MS
+} from "../lib/doctorPresence";
+import {
   applyCounterAvailability,
   clearActiveQueues,
   exportQueueData,
@@ -65,6 +72,10 @@ export default function HomePage() {
   const [stats, setStats] = useState({ waiting: 0, serving: 0, completed: 0, today_total_patients: 0 });
   const [queueRows, setQueueRows] = useState([]);
   const [counters, setCounters] = useState([]);
+  const [doctorPresence, setDoctorPresence] = useState(null);
+  const [presenceNow, setPresenceNow] = useState(() => presenceClock());
+  const presenceGenerationRef = useRef(0);
+  const presenceRequestRef = useRef(null);
   const [generatedQueue, setGeneratedQueue] = useState("");
   const [error, setError] = useState("");
   const pendingActionsRef = useRef(new Map());
@@ -103,7 +114,7 @@ export default function HomePage() {
 
   const doctorQueues = useMemo(() => {
     const states = {};
-    for (const doctorName of ["Doctor 1", "Doctor 2", "Doctor 3"]) {
+    for (const doctorName of DOCTOR_NAMES) {
       const counter = counters.find((item) => (item.id_num || item.name) === doctorName);
       const head = queueRows.filter((row) => row.status === "waiting" &&
         !row.isOptimistic && getServiceDoctor(row.service_type) === doctorName)
@@ -114,12 +125,19 @@ export default function HomePage() {
         (row.counter_id === doctorName || (!row.counter_id && getServiceDoctor(row.service_type) === doctorName)));
       states[doctorName] = {
         head,
-        online: counter?.is_online === true,
+        enabled: counter?.is_online === true,
         occupied: hasServing || (counter?.current_patient_id != null && !reservedForHead)
       };
     }
     return states;
   }, [queueRows, counters]);
+
+  const doctorStatuses = DOCTOR_NAMES.map((doctorName) => ({
+    doctorName,
+    ...doctorPresenceStatus(doctorPresence, doctorName, presenceNow)
+  }));
+  const verifiedPresence = doctorStatuses.every((doctor) => doctor.label !== "Unknown");
+  const onlineDoctorCount = doctorStatuses.filter((doctor) => doctor.label === "Online").length;
 
   const inconsistentServing = queueRows.filter((patient) => {
     if (patient.status !== "serving") return false;
@@ -192,13 +210,29 @@ export default function HomePage() {
   }, [openMenuId]);
 
   useEffect(() => {
-    if (!settings.autoRefresh) {
+    if (!settings.autoRefresh || user?.role !== "superadmin") {
       return undefined;
     }
 
     const timer = setInterval(refreshAll, Number(settings.refreshInterval || 5) * 1000);
     return () => clearInterval(timer);
-  }, [settings.autoRefresh, settings.refreshInterval]);
+  }, [settings.autoRefresh, settings.refreshInterval, user?.id_num, user?.role]);
+
+  useEffect(() => {
+    presenceGenerationRef.current += 1;
+    setDoctorPresence(null);
+    if (user?.role !== "superadmin") return undefined;
+    // Presence monitoring remains live even when automatic queue refresh is off.
+    const timer = setInterval(() => {
+      setPresenceNow(presenceClock());
+      refreshDoctorPresence();
+    }, PRESENCE_REFRESH_MS);
+    return () => {
+      presenceGenerationRef.current += 1;
+      presenceRequestRef.current?.controller.abort();
+      clearInterval(timer);
+    };
+  }, [user?.id_num, user?.role]);
 
   useEffect(() => {
     if (user && user.role === "superadmin") {
@@ -211,6 +245,7 @@ export default function HomePage() {
   }, [user, activeSection]);
 
   async function refreshAll() {
+    refreshDoctorPresence();
     try {
       const [queueData, statsData] = await Promise.all([request("/queue"), request("/stats")]);
       
@@ -240,6 +275,30 @@ export default function HomePage() {
       setStats(statsData.data || {});
     } catch (fetchError) {
       setError(fetchError.message);
+    }
+  }
+
+  async function refreshDoctorPresence() {
+    if (user?.role !== "superadmin") return;
+    const generation = presenceGenerationRef.current;
+    if (presenceRequestRef.current?.generation === generation) return;
+    const controller = new AbortController();
+    const pending = { generation, controller };
+    presenceRequestRef.current = pending;
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const data = await request("/doctors/presence", { signal: controller.signal, cache: "no-store" });
+      if (generation !== presenceGenerationRef.current) return;
+      const now = presenceClock();
+      setPresenceNow(now);
+      const snapshot = captureDoctorPresence(data, now);
+      setDoctorPresence(snapshot);
+      if (snapshot && Array.isArray(data.counters)) setCounters(data.counters);
+    } catch {
+      if (generation === presenceGenerationRef.current) setDoctorPresence(null);
+    } finally {
+      clearTimeout(timeout);
+      if (presenceRequestRef.current === pending) presenceRequestRef.current = null;
     }
   }
 
@@ -402,7 +461,7 @@ export default function HomePage() {
       const mappedDoctor = getServiceDoctor(patient.service_type);
       const state = doctorQueues[mappedDoctor];
       if (patient.status !== "waiting" || patient.id !== state?.head?.id ||
-          !state.online || state.occupied ||
+          !state.enabled || state.occupied ||
           (patient.counter_id && patient.counter_id !== mappedDoctor)) {
         setError(`Only the next eligible waiting patient for an available ${mappedDoctor} can be called.`);
         return;
@@ -571,10 +630,10 @@ export default function HomePage() {
             </h3>
             <div className="space-y-4">
               <div className="flex items-center justify-between">
-                <span className="text-xs md:text-sm brand-text-muted">Database Connection</span>
-                <span className="flex items-center text-xs font-bold text-green-700">
-                  <span className="w-2 h-2 bg-green-500 rounded-full mr-2 animate-pulse" />
-                  ONLINE
+                <span className="text-xs md:text-sm brand-text-muted">Doctor Sessions</span>
+                <span className={`flex items-center text-xs font-bold ${verifiedPresence ? "text-green-700" : "brand-text-muted"}`}>
+                  <span className={`w-2 h-2 rounded-full mr-2 ${verifiedPresence ? "bg-green-500" : "bg-gray-400"}`} />
+                  {verifiedPresence ? `${onlineDoctorCount} / 3 ONLINE` : "UNKNOWN"}
                 </span>
               </div>
               <div className="flex items-center justify-between">
@@ -1031,24 +1090,38 @@ export default function HomePage() {
               )}
 
               <div className="mb-3">
-                <h3 className="text-sm font-semibold brand-text mb-2">Counter Status</h3>
+                <h3 className="text-sm font-semibold brand-text mb-2">Doctor / Counter Status</h3>
+                {!verifiedPresence && <p className="text-xs brand-text-muted mb-2">Doctor session status cannot currently be verified. Presence is shown as Unknown until a fresh server update arrives.</p>}
                 <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2 md:gap-4">
-                  {counters.map((counter) => {
-                    const doctorName = counter.name || counter.id_num;
-                    const assigned = queueRows.find((row) => String(row.id) === String(counter.current_patient_id));
-                    const currentName = counter.current_patient_id != null
-                      ? counter.current_patient_name || assigned?.id_num || "—" : "—";
+                  {doctorStatuses.map(({ doctorName, label, lastSeenAt }) => {
+                    const counter = counters.find((item) => (item.id_num || item.name) === doctorName);
+                    const hasPointer = counter?.current_patient_id != null;
+                    const assigned = hasPointer
+                      ? queueRows.find((row) => String(row.id) === String(counter.current_patient_id))
+                      : !counter ? queueRows.find((row) => row.status === "serving" && row.counter_id === doctorName) : null;
+                    const occupied = hasPointer || !!assigned;
+                    const missingAssigned = hasPointer && !assigned;
+                    const currentName = occupied ? counter?.current_patient_name || assigned?.id_num || "—" : "—";
+                    const currentQueue = occupied ? counter?.current_patient_queue_number || assigned?.queue_number : null;
+                    const badgeStyle = label === "Online" ? "bg-green-200 text-green-800" : label === "Offline" ? "bg-red-200 text-red-800" : "bg-gray-200 text-gray-700";
                     return (
-                    <div key={counter.id} className={`border rounded-lg p-2 md:p-3 shadow-sm transition-all duration-200 ${counter.is_online ? "bg-green-50 border-green-200 hover:shadow-md" : "bg-red-50 border-red-200"}`}>
+                    <div key={doctorName} data-doctor-status={doctorName} className={`border rounded-lg p-2 md:p-3 shadow-sm transition-all duration-200 ${label === "Online" ? "bg-green-50 border-green-200 hover:shadow-md" : label === "Offline" ? "bg-red-50 border-red-200" : "bg-gray-50 border-gray-200"}`}>
                       <div className="text-center mb-1 md:mb-2">
                         <h4 className="text-[10px] md:text-sm font-bold brand-text truncate" title={doctorName}>{doctorName}</h4>
-                        <span className={`inline-block mt-0.5 md:mt-1 px-1.5 py-0.5 rounded text-[8px] md:text-[10px] font-bold uppercase tracking-wider ${counter.is_online ? "bg-green-200 text-green-800" : "bg-red-200 text-red-800"}`}>
-                          {counter.is_online ? "Online" : "Offline"}
+                        <span className={`inline-block mt-0.5 md:mt-1 px-1.5 py-0.5 rounded text-[8px] md:text-[10px] font-bold uppercase tracking-wider ${badgeStyle}`}>
+                          {label}
                         </span>
+                        <div className="mt-1 text-[9px] md:text-[11px] brand-text-muted">Counter: {counter ? (counter.is_online ? "Enabled" : "Disabled") : "Unknown"}</div>
+                        {label === "Online" && <div className="text-[9px] md:text-[11px] font-semibold brand-text">{occupied ? "Serving" : "Available"}</div>}
                       </div>
-                      <div className="text-center text-[9px] md:text-[11px] brand-text-muted">
+                      {occupied && <div className="text-center text-[9px] md:text-[11px] brand-text-muted">
                         {assigned?.status === "waiting" ? "Reserved: " : "Serving: "}<span className="font-semibold brand-text">{currentName}</span>
-                      </div>
+                        {currentQueue && <div>Current queue: <span className="font-semibold brand-text">{currentQueue}</span></div>}
+                        {missingAssigned && <div>Assigned patient ID: <span className="font-semibold brand-text">{counter.current_patient_id}</span> · Status unavailable</div>}
+                      </div>}
+                      {label === "Offline" && <div className="mt-1 text-center text-[9px] md:text-[11px] brand-text-muted">Last seen: {lastSeenAt ? <time dateTime={lastSeenAt}>{new Date(lastSeenAt).toLocaleString()}</time> : "No activity recorded"}</div>}
+                      {label === "Offline" && occupied && <p role="alert" className="mt-2 mb-0 text-[9px] md:text-[11px] text-amber-900">Doctor offline with an assigned patient. Assignment preserved; review for authorized recovery.</p>}
+                      {missingAssigned && <p role="alert" className="mt-2 mb-0 text-[9px] md:text-[11px] text-amber-900">Assigned record is outside the current queue view. Review records for authorized recovery.</p>}
                     </div>
                   ); })}
                 </div>
@@ -1081,7 +1154,7 @@ export default function HomePage() {
                       const actionPending = pendingActions.has(patient.id) || doctorPending;
                       const isNextWaiting = patient.status === "waiting" && patient.id === state?.head?.id && !patient.isOptimistic &&
                         (!patient.counter_id || patient.counter_id === getServiceDoctor(patient.service_type));
-                      const canCall = isNextWaiting && state.online && !state.occupied;
+                      const canCall = isNextWaiting && state.enabled && !state.occupied;
                       const validServing = patient.status === "serving" && !inconsistentServing.some((row) => row.id === patient.id);
                       const statusClass = patient.status === "waiting"
                         ? "bg-yellow-100 text-yellow-800"
@@ -1159,7 +1232,7 @@ export default function HomePage() {
                           <td className="px-2 py-2">
                             <div className="flex flex-wrap gap-1 items-center">
                               {isNextWaiting ? (
-                                <button type="button" onClick={() => queueAction("/queue/call", patient.id)} disabled={actionPending || !canCall} aria-busy={pendingActions.has(patient.id)} title={!state.online ? `${doctorName} is offline` : state.occupied ? `${doctorName} is already assigned to a serving patient` : undefined} className="brand-button px-2 py-1 rounded text-xs whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed">
+                                <button type="button" onClick={() => queueAction("/queue/call", patient.id)} disabled={actionPending || !canCall} aria-busy={pendingActions.has(patient.id)} title={!state.enabled ? `${doctorName} counter is disabled` : state.occupied ? `${doctorName} is already assigned to a serving patient` : undefined} className="brand-button px-2 py-1 rounded text-xs whitespace-nowrap disabled:opacity-60 disabled:cursor-not-allowed">
                                   <i className="fas fa-bullhorn mr-0.5" />
                                   {pendingActions.has(patient.id) ? "Calling..." : "Call"}
                                 </button>

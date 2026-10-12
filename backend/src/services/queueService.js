@@ -1750,7 +1750,10 @@ async function loginUser(id_num, password) {
     return {
       id_num: data.id_num,
       role: data.role,
-      doctor_name: data.doctor_name
+      doctor_name: data.doctor_name,
+      // Private login snapshot, checked under the session RPC's account lock.
+      // Never included in the returned browser profile or signed JWT.
+      auth_revision: data.auth_revision
     };
   } catch (err) {
     if (err.message?.includes("Supabase") || err.message?.includes("fetch failed")) {

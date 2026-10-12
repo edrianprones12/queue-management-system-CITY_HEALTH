@@ -249,6 +249,7 @@ function createHarness(options = {}) {
   loadModule("src/routes/index.js", {
     express: { Router: () => router },
     jsonwebtoken: {},
+    "node:crypto": crypto,
     "../config/env": {},
     "../middleware/auth": {
       // Requests provide an already verified identity. JWT cryptography itself
@@ -257,6 +258,9 @@ function createHarness(options = {}) {
       authorizeRole: (roles) => (req, res, next) => roles.includes(req.user?.role) ? next() : res.status(403).json({ success: false, message: "Unauthorized access" })
     },
     "../services/queueService": service,
+    // Queue regression tests supply an already authenticated identity. Session
+    // SQL and real JWT/middleware behavior have separate Phase A tests.
+    "../services/presenceService": options.presence || {},
     "../services/settingsService": settings
   }, clock);
 

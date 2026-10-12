@@ -6,6 +6,7 @@ const vm = require("node:vm");
 const swc = require("next/dist/build/swc");
 
 let componentCode;
+let presenceHelpers;
 before(async () => {
   await swc.loadBindings();
   const filename = path.join(__dirname, "../pages/index.js");
@@ -15,6 +16,13 @@ before(async () => {
     module: { type: "commonjs" }
   });
   componentCode = result.code;
+  const presenceFilename = path.join(__dirname, "../lib/doctorPresence.js");
+  const helpers = await swc.transform(fs.readFileSync(presenceFilename, "utf8"), {
+    filename: presenceFilename, jsc: { parser: { syntax: "ecmascript" } }, module: { type: "commonjs" }
+  });
+  const helperModule = { exports: {} };
+  vm.runInNewContext(helpers.code, { module: helperModule, exports: helperModule.exports });
+  presenceHelpers = helperModule.exports;
 });
 
 function patient(id, service = "consultation", score = 1, created = "2026-10-10T01:00:00Z") {
@@ -61,10 +69,10 @@ async function harness(initialRows, options = {}) {
   };
   const module = { exports: {} };
   vm.runInNewContext(componentCode, {
-    module, exports: module.exports, Set, Map, console,
+    module, exports: module.exports, Set, Map, console, AbortController,
     document: { addEventListener() {}, removeEventListener() {} },
     window: { confirm: () => true, prompt: () => options.cancelReason === undefined ? "Test cancellation reason" : options.cancelReason, setTimeout() {} }, confirm: () => true,
-    setInterval: () => 1, clearInterval() {},
+    setInterval: () => 1, clearInterval() {}, setTimeout: () => 1, clearTimeout() {},
     require(name) {
       if (name === "react") return react;
       if (name === "react/jsx-runtime") return { jsx, jsxs: jsx, Fragment: "fragment" };
@@ -82,8 +90,12 @@ async function harness(initialRows, options = {}) {
         calls.push({ route, method: init.method || "GET", ...(init.body ? { body: JSON.parse(init.body) } : {}) });
         if (route === "/queue" && !init.method) return clone(backend);
         if (route === "/stats") return { data: {} };
+        if (route === "/doctors/presence") return { success: true, doctors: [1, 2, 3].map(number => ({
+          doctor_name: `Doctor ${number}`, online: true, last_seen_at: new Date().toISOString()
+        })), observed_at: new Date().toISOString(), timeout_seconds: 75 };
         return options.request ? options.request(route, init, backend) : { success: true };
       } };
+      if (name === "../lib/doctorPresence") return presenceHelpers;
       throw new Error(`Unexpected dependency: ${name}`);
     }
   });

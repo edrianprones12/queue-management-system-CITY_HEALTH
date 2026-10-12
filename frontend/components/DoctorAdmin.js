@@ -591,7 +591,7 @@ export default function DoctorAdminPage({ doctorId, doctorName }) {
         ) : null}
         {!doctorIsOnline ? (
           <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-            This doctor counter is offline in System Settings. Calls are blocked until Super Admin enables availability.
+            This doctor counter is disabled in System Settings. Calls are blocked until Super Admin enables availability.
           </div>
         ) : null}
         {storageMode === "local_fallback" ? (

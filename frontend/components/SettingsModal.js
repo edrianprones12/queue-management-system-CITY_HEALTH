@@ -417,9 +417,9 @@ export default function SettingsModal({
                 </button>
               </SettingRow>
               <div className="mt-3 rounded-lg border brand-border p-3">
-                <div className="text-sm font-semibold brand-text mb-2">Doctor Availability</div>
+                <div className="text-sm font-semibold brand-text mb-2">Doctor Counter Availability</div>
                 <p className="text-xs brand-text-muted mb-3 m-0">
-                  Mark doctors online/offline. Offline doctors are skipped for automatic counter assignment.
+                  Enable or disable doctor counters for assignment. Disabled counters are skipped for automatic assignment. This setting is separate from doctor login presence.
                 </p>
                 {[
                   { key: "doctor1Online", label: "Doctor 1" },

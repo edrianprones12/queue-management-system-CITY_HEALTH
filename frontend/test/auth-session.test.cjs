@@ -5,7 +5,7 @@ const path = require("node:path");
 const vm = require("node:vm");
 const swc = require("next/dist/build/swc");
 
-let authCode, apiCode;
+let authCode, apiCode, heartbeatCode;
 before(async () => {
   await swc.loadBindings();
   async function compile(relative) {
@@ -16,7 +16,9 @@ before(async () => {
       module: { type: "commonjs" }
     })).code;
   }
-  [authCode, apiCode] = await Promise.all([compile("context/AuthContext.js"), compile("lib/api.js")]);
+  [authCode, apiCode, heartbeatCode] = await Promise.all([
+    compile("context/AuthContext.js"), compile("lib/api.js"), compile("lib/authHeartbeat.js")
+  ]);
 });
 
 const doctor = (number) => ({ id_num: `admin${number}`, role: "admin", doctor_name: `Doctor ${number}` });
@@ -34,9 +36,15 @@ function harness(options = {}) {
     clear: () => values.clear()
   };
   const listeners = new Map(), events = [], routes = [], hooks = [], effects = [], cleanups = [];
+  const timeouts = new Map();
+  let timeoutId = 0;
   let cursor = 0;
   const window = {
     localStorage: storage,
+    setInterval: () => 1,
+    clearInterval() {},
+    setTimeout(callback) { const id = ++timeoutId; timeouts.set(id, callback); return id; },
+    clearTimeout(id) { timeouts.delete(id); },
     addEventListener(name, callback) {
       if (!listeners.has(name)) listeners.set(name, new Set());
       listeners.get(name).add(callback);
@@ -68,17 +76,24 @@ function harness(options = {}) {
   vm.runInNewContext(apiCode, {
     module: apiModule, exports: apiModule.exports, process: { env: {} }, window, localStorage: storage, Event,
     console: { log() {}, error() {} },
-    fetch: async (url, init) => options.fetch ? options.fetch(url, init, response) : response(200, { success: true })
+    fetch: async (url, init) => {
+      if (url.endsWith("/auth/heartbeat") && !options.heartbeatFetch) return response(200, { success: true });
+      return options.fetch ? options.fetch(url, init, response) : response(200, { success: true });
+    }
   });
+  const heartbeatModule = { exports: {} };
+  vm.runInNewContext(heartbeatCode, { module: heartbeatModule, exports: heartbeatModule.exports, Map, AbortController });
   const router = { push: (route) => routes.push(route) };
   const authModule = { exports: {} };
   vm.runInNewContext(authCode, {
-    module: authModule, exports: authModule.exports, window, localStorage: storage, console,
+    module: authModule, exports: authModule.exports, window, localStorage: storage, console, Event, AbortController,
+    document: { visibilityState: "visible", addEventListener() {}, removeEventListener() {} },
     require(name) {
       if (name === "react") return react;
       if (name === "react/jsx-runtime") return { jsx: (type, props) => ({ type, props }) };
       if (name === "next/router") return { useRouter: () => router };
       if (name === "../lib/api") return apiModule.exports;
+      if (name === "../lib/authHeartbeat") return heartbeatModule.exports;
       throw new Error(`Unexpected dependency: ${name}`);
     }
   });
@@ -86,7 +101,7 @@ function harness(options = {}) {
   render();
   effects.splice(0).forEach((effect) => { const cleanup = effect(); if (cleanup) cleanups.push(cleanup); });
   const storageEvent = (key, storageArea = storage) => window.dispatchEvent({ type: "storage", key, storageArea });
-  return { render, storage, storageEvent, request: apiModule.exports.request, events, routes, listeners,
+  return { render, storage, storageEvent, request: apiModule.exports.request, events, routes, listeners, timeouts,
     cleanup: () => cleanups.forEach((cleanup) => cleanup()) };
 }
 
@@ -206,4 +221,73 @@ test("unmount removes the authentication listeners", () => {
   h.cleanup();
   assert.equal(h.listeners.get("storage").size, 0);
   assert.equal(h.listeners.get("city-health-auth-session-changed").size, 0);
+});
+
+test("explicit logout waits for server revocation before clearing local credentials", async () => {
+  let finish;
+  const h = harness({ fetch: (_url, _init, response) => new Promise((resolve) => {
+    finish = () => resolve(response(200, { success: true }));
+  }) });
+  const pending = h.render().logout();
+  assert.equal(h.storage.getItem("city_health_token"), "doctor-one-test-token");
+  finish();
+  assert.equal((await pending).success, true);
+  assert.equal(h.storage.getItem("city_health_token"), null);
+  assert.equal(h.render().user, null);
+  assert.deepEqual(h.routes, ["/login"]);
+});
+
+test("unconfirmed logout keeps the session and exposes a retry message", async () => {
+  const h = harness({ fetch: async () => { throw new TypeError("Network disconnected"); } });
+  assert.equal((await h.render().logout()).success, false);
+  assert.equal(h.storage.getItem("city_health_token"), "doctor-one-test-token");
+  assert.match(h.render().logoutError, /Logout could not be confirmed/);
+  assert.equal(h.render().user.id_num, "admin1");
+  assert.deepEqual(h.routes, []);
+});
+
+test("a delayed successful logout cannot clear a newly logged-in account", async () => {
+  let finish;
+  const h = harness({ fetch: (_url, _init, response) => new Promise((resolve) => {
+    finish = () => resolve(response(200, { success: true }));
+  }) });
+  const pending = h.render().logout();
+  h.storage.setItem("city_health_token", "doctor-three-test-token");
+  h.storage.setItem("city_health_user", JSON.stringify(doctor(3)));
+  h.storageEvent("city_health_user");
+  finish();
+  await pending;
+  assert.equal(h.storage.getItem("city_health_token"), "doctor-three-test-token");
+  assert.equal(h.render().user.id_num, "admin3");
+  assert.deepEqual(h.routes, []);
+});
+
+test("a captured older token can be revoked without changing the current request session", async () => {
+  let authorization;
+  const h = harness({ fetch: async (_url, init, response) => {
+    authorization = init.headers.Authorization;
+    assert.equal(init.authToken, undefined);
+    return response(401, { message: "Authentication session revoked" });
+  } });
+  await h.request("/auth/logout", { method: "POST", authToken: "older-test-token" });
+  assert.equal(authorization, "Bearer older-test-token");
+  assert.equal(h.storage.getItem("city_health_token"), "doctor-one-test-token");
+});
+
+test("a stalled logout times out and offers retry without falsely clearing the session", async () => {
+  const h = harness({ fetch: (_url, init) => new Promise((_resolve, reject) => {
+    init.signal.addEventListener("abort", () => reject(new Error("Request aborted")));
+  }) });
+  const pending = h.render().logout();
+  h.timeouts.get(Math.max(...h.timeouts.keys()))();
+  assert.equal((await pending).success, false);
+  assert.equal(h.storage.getItem("city_health_token"), "doctor-one-test-token");
+  assert.match(h.render().logoutError, /try again/);
+});
+
+test("an unacknowledged logout response cannot be mistaken for server revocation", async () => {
+  const h = harness({ fetch: async (_url, _init, response) => response(200, {}) });
+  assert.equal((await h.render().logout()).success, false);
+  assert.equal(h.render().user.id_num, "admin1");
+  assert.match(h.render().logoutError, /could not be confirmed/);
 });

@@ -1,15 +1,21 @@
 import React, { createContext, useContext, useState, useEffect } from "react";
 import { useRouter } from "next/router";
 import { AUTH_SESSION_CHANGED_EVENT, request } from "../lib/api";
+import { startAuthHeartbeat } from "../lib/authHeartbeat";
 
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [logoutError, setLogoutError] = useState("");
   const router = useRouter();
 
   useEffect(() => {
+    const heartbeat = startAuthHeartbeat({
+      request, storage: localStorage, eventTarget: window, visibilityTarget: document, timers: window
+    });
+    let synchronizedToken;
     function synchronizeSession() {
       const storedUser = localStorage.getItem("city_health_user");
       const token = localStorage.getItem("city_health_token");
@@ -29,6 +35,11 @@ export function AuthProvider({ children }) {
         setUser(null);
       }
       setLoading(false);
+      if (token !== synchronizedToken) {
+        synchronizedToken = token;
+        setLogoutError("");
+        heartbeat.pulse();
+      }
     }
 
     function handleStorageChange(event) {
@@ -46,6 +57,7 @@ export function AuthProvider({ children }) {
     return () => {
       window.removeEventListener("storage", handleStorageChange);
       window.removeEventListener(AUTH_SESSION_CHANGED_EVENT, synchronizeSession);
+      heartbeat.stop();
     };
   }, []);
 
@@ -67,6 +79,7 @@ export function AuthProvider({ children }) {
         localStorage.setItem("city_health_token", response.token);
         localStorage.setItem("city_health_user", JSON.stringify(response.user));
         setUser(response.user);
+        window.dispatchEvent(new Event(AUTH_SESSION_CHANGED_EVENT));
         
         if (response.user.role === "superadmin") {
           router.push("/");
@@ -85,14 +98,40 @@ export function AuthProvider({ children }) {
     }
   };
 
-  const logout = () => {
+  const logout = async () => {
+    const token = localStorage.getItem("city_health_token");
+    setLogoutError("");
+    if (token) {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 10000);
+      let response;
+      try {
+        response = await request("/auth/logout", {
+          method: "POST", body: "{}", authToken: token, signal: controller.signal
+        });
+      } catch (_error) {
+        response = { error: "Logout request failed" };
+      } finally {
+        window.clearTimeout(timeout);
+      }
+      // A delayed logout cannot remove a newer login in this or another tab.
+      const currentToken = localStorage.getItem("city_health_token");
+      if (currentToken && currentToken !== token) return { success: false };
+      if ((!response.success || response.error) && currentToken === token) {
+        const message = "Logout could not be confirmed by the server. Check your connection and try again.";
+        setLogoutError(message);
+        return { success: false, message };
+      }
+    }
     localStorage.removeItem("city_health_token");
     localStorage.removeItem("city_health_user");
+    window.dispatchEvent(new Event(AUTH_SESSION_CHANGED_EVENT));
     setUser(null);
     router.push("/login");
+    return { success: true };
   };
 
-  const value = { user, login, logout, loading };
+  const value = { user, login, logout, loading, logoutError };
 
   return (
     <AuthContext.Provider value={value}>

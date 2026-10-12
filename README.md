@@ -10,6 +10,8 @@ Configure `backend/.env` and `frontend/.env` using their `.env.example` files if
 
 For Phase 2, apply the [versioned consultation migration](backend/scripts/20261010-phase2-consultation-lifecycle.sql) to an approved development Supabase project before using Start/Complete Consultation. Follow the [migration and verification guide](docs/phase2-consultation.md). The application does not apply schema changes automatically; production application requires explicit approval.
 
+Phase A adds authenticated doctor presence separately from counter enablement and patient occupancy. Apply its [versioned session migration](backend/scripts/20261012-phase-a-auth-presence.sql) before deploying this code, then sign in again. See the [presence and rollout guide](docs/phase-a-doctor-presence.md) for heartbeat/logout behavior, access controls and verification. Live migration application is a separate rollout step; the local implementation does not apply it automatically.
+
 Install dependencies when setting up a new checkout:
 
 ```sh

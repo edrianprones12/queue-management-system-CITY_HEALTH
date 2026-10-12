@@ -1,7 +1,14 @@
 const express = require("express");
 const jwt = require("jsonwebtoken");
+const { randomUUID } = require("node:crypto");
 const env = require("../config/env");
 const { authenticateToken, authorizeRole } = require("../middleware/auth");
+const {
+  createAuthSession,
+  heartbeatAuthSession,
+  revokeAuthSession,
+  getDoctorPresence
+} = require("../services/presenceService");
 const {
   buildCsv,
   callPatient,
@@ -80,17 +87,54 @@ router.get("/health", (_req, res) => {
 router.post("/auth/login", async (req, res) => {
   try {
     const { id_num, password } = req.body;
-    const user = await loginUser(id_num, password);
-    
+    const verifiedUser = await loginUser(id_num, password);
+    const user = { id_num: verifiedUser.id_num, role: verifiedUser.role, doctor_name: verifiedUser.doctor_name };
+    const sessionId = randomUUID();
+    const session = await createAuthSession(verifiedUser, sessionId);
     const token = jwt.sign(
-      { id_num: user.id_num, role: user.role, doctor_name: user.doctor_name },
+      {
+        id_num: user.id_num, role: user.role, doctor_name: user.doctor_name,
+        jti: sessionId, exp: Math.floor(Date.parse(session.expires_at) / 1000)
+      },
       env.jwtSecret,
-      { expiresIn: "8h" }
+      { algorithm: "HS256" }
     );
 
+    res.setHeader("Cache-Control", "no-store");
     res.json({ success: true, token, user });
   } catch (error) {
     res.status(error.statusCode || 401).json({ success: false, message: error.message });
+  }
+});
+
+router.post("/auth/heartbeat", authenticateToken, async (req, res) => {
+  try {
+    const session = await heartbeatAuthSession(req.user);
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ success: true, last_seen_at: session.last_seen_at, expires_at: session.expires_at });
+  } catch (error) {
+    res.status(error.statusCode || 503).json({ success: false, message: error.message });
+  }
+});
+
+router.post("/auth/logout", authenticateToken, async (req, res) => {
+  try {
+    await revokeAuthSession(req.user);
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ success: true, message: "Session logged out" });
+  } catch (error) {
+    res.status(error.statusCode || 503).json({ success: false, message: error.message });
+  }
+});
+
+router.get("/doctors/presence", authenticateToken, authorizeRole(["superadmin"]), async (_req, res) => {
+  try {
+    const counters = await getCounters();
+    const data = await getDoctorPresence(counters);
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ success: true, ...data, counters });
+  } catch (error) {
+    res.status(error.statusCode || 503).json({ success: false, message: error.message });
   }
 });
 

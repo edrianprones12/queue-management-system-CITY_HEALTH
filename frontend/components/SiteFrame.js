@@ -33,7 +33,7 @@ export default function SiteFrame({
   profileIcon = "fas fa-user-md",
   contentClassName = ""
 }) {
-  const { user, logout } = useAuth();
+  const { user, logout, logoutError } = useAuth();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const profileMenuRef = useRef(null);
@@ -64,6 +64,11 @@ export default function SiteFrame({
 
   return (
     <div className="layout-shell">
+      {logoutError ? (
+        <div role="alert" className="bg-red-50 text-red-700 border border-red-200 rounded p-3 mb-3 text-sm">
+          {logoutError}
+        </div>
+      ) : null}
       {showSidebar ? (
         <>
           <div id="sidebar" className={`sidebar ${sidebarOpen ? "active" : ""}`}>

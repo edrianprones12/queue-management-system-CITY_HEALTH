@@ -3,16 +3,19 @@ export const AUTH_SESSION_CHANGED_EVENT = "city-health-auth-session-changed";
 
 export async function request(path, options = {}) {
   const url = `${API_BASE_URL}${path}`;
+  const { authToken, ...fetchOptions } = options;
   
   // Get token from localStorage if in browser
   let token = null;
-  if (typeof window !== "undefined") {
+  if (authToken !== undefined) {
+    token = authToken;
+  } else if (typeof window !== "undefined") {
     token = localStorage.getItem("city_health_token");
   }
 
   const headers = {
     "Content-Type": "application/json",
-    ...(options.headers || {})
+    ...(fetchOptions.headers || {})
   };
 
   if (token) {
@@ -23,7 +26,7 @@ export async function request(path, options = {}) {
   let response;
   try {
     response = await fetch(url, {
-      ...options,
+      ...fetchOptions,
       headers
     });
   } catch (err) {
