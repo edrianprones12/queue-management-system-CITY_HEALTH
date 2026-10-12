@@ -1,5 +1,6 @@
 const supabase = require("../lib/supabase");
 const env = require("../config/env");
+const { randomUUID } = require("node:crypto");
 const bcrypt = require("bcryptjs");
 const {
   sendQueueCreatedNotification,
@@ -410,6 +411,7 @@ async function createQueueEntry({ idNum, serviceType, mobileNumber, residency, p
       if (useLocalFallback) {
         const patient = {
           id: localData.nextPatientId++,
+          visit_state_revision: randomUUID(),
           queue_number: queueNumber,
           id_num: idNum,
           service_type: serviceType,
@@ -1098,13 +1100,90 @@ async function recallPatient(patientId, counterId = null) {
   return { success: true, recall_count: nextCount, max_recalls: maxRecalls };
 }
 
-async function requeuePatient(patientId, reason = null) {
+function requireRecoveryActor(actor) {
+  if (!actor || !["admin", "superadmin"].includes(actor.role) || !String(actor.id_num || "").trim()) {
+    throw consultationError("An authenticated staff account is required for recovery", 403);
+  }
+}
+
+function assertRecoverySnapshot(current, expected) {
+  const fields = ["visit_state_revision", "status", "created_at", "called_at", "consultation_started_at", "completed_at", "counter_id"];
+  if (!current || fields.some((field) => (current[field] ?? null) !== (expected[field] ?? null))) {
+    throw consultationError("Patient visit changed; refresh before retrying recovery", 409);
+  }
+  if (current.status === "completed" && current.consultation_started_at != null) {
+    throw consultationError("Completed consultation history must be preserved. Register a new visit instead.");
+  }
+}
+
+async function recoverPatientVisit(existing, action, actor, reason = null) {
+  requireRecoveryActor(actor);
+  if (useLocalFallback) {
+    const patient = localData.patients.find((row) => row.id === existing.id);
+    assertRecoverySnapshot(patient, existing);
+    // No await between final validation and recovery in temporary memory.
+    patient.status = "waiting";
+    patient.completed_at = null;
+    patient.consultation_started_at = null;
+    patient.visit_state_revision = randomUUID();
+    if (action === "requeue") {
+      patient.created_at = new Date().toISOString();
+      patient.called_at = null;
+      patient.counter_id = null;
+      patient.reason = reason;
+    }
+    // Preserve the existing local Undo semantics (no counter reservation).
+    return parsePatientPriority(patient);
+  }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(existing.visit_state_revision || "")) {
+    throw consultationError("Phase 2.1 database migration is required before Requeue or Undo.", 503);
+  }
+  let result;
+  try {
+    result = await supabase.rpc("recover_patient_visit", {
+      p_patient_id: existing.id,
+      p_action: action,
+      p_user_id_num: actor.id_num,
+      p_expected_revision: existing.visit_state_revision,
+      p_expected_status: existing.status,
+      // Pass the original PostgreSQL strings, retaining all microseconds.
+      p_expected_created_at: existing.created_at,
+      p_expected_called_at: existing.called_at ?? null,
+      p_expected_started_at: existing.consultation_started_at ?? null,
+      p_expected_completed_at: existing.completed_at ?? null,
+      p_expected_counter_id: existing.counter_id ?? null,
+      p_reason: reason
+    });
+  } catch (_error) {
+    throw consultationError("Patient recovery storage is unavailable. Please retry.", 503);
+  }
+  if (result?.error) {
+    const error = result.error;
+    if (["PGRST202", "PGRST204", "42883", "42703"].includes(error.code)) {
+      throw consultationError("Phase 2.1 database migration is required before Requeue or Undo.", 503);
+    }
+    const status = error.code === "40001" ? 409 : error.code === "42501" ? 403 : error.code === "P0002" ? 404 :
+      ["P0001", "22023"].includes(error.code) ? 400 : 503;
+    throw consultationError(error.message || "Patient recovery failed", status);
+  }
+  const patient = Array.isArray(result?.data) ? result.data[0] : result?.data;
+  if (!patient || patient.id !== existing.id || patient.status !== "waiting" ||
+      !patient.visit_state_revision || patient.visit_state_revision === existing.visit_state_revision ||
+      patient.consultation_started_at != null || patient.completed_at != null) {
+    throw consultationError("Could not confirm recovery. Refresh the queue before retrying.", 503);
+  }
+  return parsePatientPriority(patient);
+}
+
+async function requeuePatient(patientId, reason = null, actor) {
   const settings = getQueueSettings();
   if (settings.allowQueueReassignment === false) {
     throw new Error("Queue reassignment is disabled in System Settings.");
   }
 
-  const existing = await getPatientById(patientId);
+  if (!Number.isSafeInteger(patientId) || patientId <= 0) throw consultationError("A valid patient ID is required");
+  const found = await getPatientById(patientId);
+  const existing = found && { ...found };
 
   if (!existing) {
     throw new Error("Patient not found");
@@ -1113,49 +1192,16 @@ async function requeuePatient(patientId, reason = null) {
     throw new Error("Completed consultation history must be preserved. Register a new visit instead.");
   }
 
-  // FRD-04: Manually re-queue the patient at the bottom of the same priority tier
-  // We update the created_at to now to put them at the bottom
-  if (useLocalFallback) {
-    const patientIndex = localData.patients.findIndex(p => p.id === patientId);
-    if (patientIndex !== -1) {
-      localData.patients[patientIndex].status = "waiting";
-      localData.patients[patientIndex].created_at = new Date().toISOString();
-      localData.patients[patientIndex].completed_at = null;
-      localData.patients[patientIndex].consultation_started_at = null;
-      localData.patients[patientIndex].called_at = null;
-      localData.patients[patientIndex].counter_id = null;
-      localData.patients[patientIndex].reason = reason;
-    }
-    clearRecallCount(patientId);
-    return localData.patients[patientIndex];
-  }
-  
-  const { data, error } = await supabase
-    .from("patients")
-    .update({ 
-      status: "waiting", 
-      created_at: new Date().toISOString(),
-      completed_at: null,
-      consultation_started_at: null,
-      called_at: null,
-      counter_id: null,
-      reason
-    })
-    .eq("id", patientId)
-    .eq("status", existing.status)
-    .select("*")
-    .single();
-
-  if (error) {
-    throw formatError(error, "Failed to re-queue patient");
-  }
-
+  // FRD-04 remains unchanged: move to the bottom of the same priority tier.
+  const data = await recoverPatientVisit(existing, "requeue", actor, reason);
   clearRecallCount(patientId);
   return data;
 }
 
-async function undoPatientAction(patientId) {
-  const existing = await getPatientById(patientId);
+async function undoPatientAction(patientId, actor) {
+  if (!Number.isSafeInteger(patientId) || patientId <= 0) throw consultationError("A valid patient ID is required");
+  const found = await getPatientById(patientId);
+  const existing = found && { ...found };
 
   if (!existing) {
     throw new Error("Patient not found");
@@ -1168,30 +1214,7 @@ async function undoPatientAction(patientId) {
     throw new Error("Only completed, cancelled, or no-show patients can be undone");
   }
 
-  if (useLocalFallback) {
-    const patientIndex = localData.patients.findIndex(p => p.id === patientId);
-    if (patientIndex !== -1) {
-      localData.patients[patientIndex].status = "waiting";
-      localData.patients[patientIndex].completed_at = null;
-      localData.patients[patientIndex].consultation_started_at = null;
-    }
-    return localData.patients[patientIndex];
-  }
-  
-  const { data, error } = await supabase
-    .from("patients")
-    .update({ status: "waiting", completed_at: null, consultation_started_at: null })
-    .eq("id", patientId)
-    .eq("status", existing.status)
-    .select("*")
-    .single();
-
-  if (error) {
-    throw formatError(error, "Failed to undo patient action");
-  }
-
-  await assignCounter(patientId);
-  return data;
+  return recoverPatientVisit(existing, "undo", actor);
 }
 
 async function clearTodaysQueues() {
