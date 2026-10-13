@@ -12,6 +12,8 @@ For Phase 2, apply the [versioned consultation migration](backend/scripts/202610
 
 Phase A adds authenticated doctor presence separately from counter enablement and patient occupancy. Apply its [versioned session migration](backend/scripts/20261012-phase-a-auth-presence.sql) before deploying this code, then sign in again. See the [presence and rollout guide](docs/phase-a-doctor-presence.md) for heartbeat/logout behavior, access controls and verification. Live migration application is a separate rollout step; the local implementation does not apply it automatically.
 
+Phase A.1 has a [development preflight report](docs/phase-a1-development-preflight.md) and [read-only catalog checks](backend/scripts/20261013-phase-a1-preflight.sql). The intended development project is confirmed; access, live schema checks, migration approval and browser/concurrency verification remain pending. Publishing these files does not apply or authorize a database migration.
+
 Install dependencies when setting up a new checkout:
 
 ```sh
