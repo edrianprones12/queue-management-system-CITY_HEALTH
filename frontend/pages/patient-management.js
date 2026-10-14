@@ -2,18 +2,23 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/router";
 import SiteFrame from "../components/SiteFrame";
 import PatientQueueTable, { DOCTORS } from "../components/PatientQueueTable";
+import FrontdeskNavigation from "../components/FrontdeskNavigation";
+import QueueTicketDialog from "../components/QueueTicketDialog";
 import { defaultQueueSettings } from "../components/SettingsModal";
 import { useAuth } from "../context/AuthContext";
 import { request } from "../lib/api";
 import { frontdeskSidebarLinks } from "../lib/frontdeskNav";
+import { createQueueTicket, fetchExistingQueueTicket } from "../lib/queueTicket";
 import { fetchQueueSettings, loadLocalQueueSettings, mergeQueueSettings } from "../lib/queueSettings";
 
 const STATUS_OPTIONS = [
   { value: "active", label: "Active Queue" },
+  { value: "all", label: "All registered patients" },
   { value: "waiting", label: "Waiting" },
   { value: "serving", label: "Serving" },
   { value: "completed", label: "Completed" },
-  { value: "cancelled", label: "Cancelled" }
+  { value: "cancelled", label: "Cancelled" },
+  { value: "no-show", label: "No-show" }
 ];
 
 const DOCTOR_ACCOUNTS = ["admin1", "admin2", "admin3"];
@@ -41,6 +46,13 @@ export default function PatientManagementPage() {
   const [statusFilter, setStatusFilter] = useState("active");
   const [search, setSearch] = useState("");
   const [modal, setModal] = useState(closedModal);
+  const [queueTicket, setQueueTicket] = useState(null);
+  const [ticketLoadingId, setTicketLoadingId] = useState(null);
+  const ticketLoadingRef = useRef(null);
+  const ticketPatientIdRef = useRef(null);
+  const ticketRequestRef = useRef(0);
+  const queueReadRef = useRef(0);
+  const queueSettledRef = useRef(0);
   const modalReasonRef = useRef("");
   const modalConfirmRef = useRef(null);
   const noticeTimerRef = useRef(null);
@@ -55,22 +67,63 @@ export default function PatientManagementPage() {
   }, [user, authLoading, router]);
 
   const canView = !!user && !DOCTOR_ACCOUNTS.includes(user.id_num);
+  const canIssueTicket = user?.id_num === "frontdesk" || user?.role === "superadmin";
+  const canIssueTicketRef = useRef(canIssueTicket);
+  canIssueTicketRef.current = canIssueTicket;
+
+  useEffect(() => {
+    if (!canIssueTicket) {
+      ticketRequestRef.current += 1;
+      ticketPatientIdRef.current = null;
+      ticketLoadingRef.current = null;
+      setQueueTicket(null);
+      setTicketLoadingId(null);
+    }
+    return () => { ticketRequestRef.current += 1; };
+  }, [canIssueTicket]);
 
   const refreshAll = useCallback(async () => {
+    const queueReadVersion = ++queueReadRef.current;
+    const ticketReadVersion = ticketRequestRef.current;
     setLoading(true);
     try {
       const data = await request("/queue");
+      // Polling and manual refreshes can overlap. A delayed older response
+      // cannot replace a newer completed read. Accept earlier completions
+      // while a newer read is pending, so slow polling still updates the UI.
+      if (queueReadVersion < queueSettledRef.current) return;
+      queueSettledRef.current = queueReadVersion;
       if (data.error) {
-        setNotice({ type: "error", text: data.error });
-        return;
+        throw new Error(data.error);
       }
-      setQueueRows(data.patients ?? []);
+      const patients = data.patients ?? [];
+      setQueueRows(patients);
       setCounters(data.counters ?? []);
       if (data.queue_settings) {
         setQueueSettings(mergeQueueSettings(data.queue_settings));
       }
+      // Refresh only a pass opened before this read began. An older polling
+      // response must not replace a ticket just retrieved from its saved record.
+      if (ticketReadVersion === ticketRequestRef.current && ticketPatientIdRef.current != null) {
+        const patient = patients.find((row) => String(row.id) === String(ticketPatientIdRef.current));
+        if (patient) {
+          setQueueTicket(createQueueTicket(patient));
+        } else {
+          ticketPatientIdRef.current = null;
+          setQueueTicket(null);
+          setNotice({ type: "error", text: "This ticket is no longer available in the current queue. Refresh Patient Management before reopening it." });
+        }
+      }
+    } catch (error) {
+      if (queueReadVersion < queueSettledRef.current) return;
+      queueSettledRef.current = queueReadVersion;
+      if (ticketReadVersion === ticketRequestRef.current && ticketPatientIdRef.current != null) {
+        ticketPatientIdRef.current = null;
+        setQueueTicket(null);
+      }
+      setNotice({ type: "error", text: error.message || "Unable to refresh the queue. Reopen the ticket after the connection is restored." });
     } finally {
-      setLoading(false);
+      if (queueReadVersion === queueReadRef.current) setLoading(false);
     }
   }, []);
 
@@ -94,6 +147,48 @@ export default function PatientManagementPage() {
     clearTimeout(noticeTimerRef.current);
     setNotice({ type, text });
     noticeTimerRef.current = setTimeout(() => setNotice({ type: "", text: "" }), type === "error" ? 5000 : 4000);
+  }
+
+  async function handleViewTicket(row) {
+    if (!canIssueTicketRef.current || row?.id == null || ticketLoadingRef.current != null) return;
+    const requestVersion = ++ticketRequestRef.current;
+    ticketLoadingRef.current = row.id;
+    setTicketLoadingId(row.id);
+    setNotice({ type: "", text: "" });
+    try {
+      // Recovery is an authenticated read of the existing registration. It
+      // never submits registration, queue-number allocation, or queue actions.
+      const ticket = await fetchExistingQueueTicket(row.id);
+      if (requestVersion !== ticketRequestRef.current || !canIssueTicketRef.current) return;
+      ticketPatientIdRef.current = ticket.patientId;
+      setQueueTicket(ticket);
+    } catch (error) {
+      if (requestVersion === ticketRequestRef.current) {
+        notify("error", error.message || "Unable to retrieve this ticket. Please refresh and try again.");
+      }
+    } finally {
+      if (requestVersion === ticketRequestRef.current) {
+        ticketLoadingRef.current = null;
+        setTicketLoadingId(null);
+      }
+    }
+  }
+
+  function updateCurrentTicket(updated) {
+    if (!canIssueTicketRef.current || ticketPatientIdRef.current == null ||
+        String(updated?.patientId) !== String(ticketPatientIdRef.current)) return;
+    // Delivery verifies the record again. Reads started before that verified
+    // result cannot replace it with an older status when they arrive later.
+    ticketRequestRef.current += 1;
+    setQueueTicket(updated);
+  }
+
+  function closeTicket() {
+    ticketRequestRef.current += 1;
+    ticketPatientIdRef.current = null;
+    ticketLoadingRef.current = null;
+    setTicketLoadingId(null);
+    setQueueTicket(null);
   }
 
   function showConfirmModal({ title, message, showReason = false, requireReason = false, onConfirm }) {
@@ -146,8 +241,10 @@ export default function PatientManagementPage() {
       contentClassName="frontdesk-page"
     >
       <div className="w-full max-w-7xl mx-auto px-3 md:px-6 py-4">
+        <FrontdeskNavigation activePath="/patient-management" />
         {notice.text ? (
           <div
+            role={notice.type === "error" ? "alert" : "status"}
             className={`mb-4 rounded-lg border px-4 py-3 text-sm ${
               notice.type === "error"
                 ? "border-red-200 bg-red-50 text-red-700"
@@ -165,6 +262,7 @@ export default function PatientManagementPage() {
               <div>
                 <h2 className="font-bold brand-text text-lg m-0">Patient Management</h2>
                 <p className="text-xs brand-text-muted m-0">Manage all doctors' patients in one table. Changes sync with the doctor accounts.</p>
+                {canIssueTicket ? <p className="text-xs brand-text-muted mt-1 mb-0">Lost ticket? Choose All registered patients to search today's registrations, then select View Ticket to photograph, download, or reprint the same queue number.</p> : null}
               </div>
             </div>
             <div className="flex gap-2">
@@ -250,8 +348,14 @@ export default function PatientManagementPage() {
           onRefresh={refreshAll}
           onNotify={notify}
           onConfirm={showConfirmModal}
+          onViewTicket={canIssueTicket ? handleViewTicket : undefined}
+          ticketLoadingId={ticketLoadingId}
         />
       </div>
+
+      {queueTicket && canIssueTicket ? (
+        <QueueTicketDialog ticket={queueTicket} onClose={closeTicket} onTicketUpdate={updateCurrentTicket} />
+      ) : null}
 
       {modal.isOpen && (
         <div className="fixed inset-0 bg-black/50 z-[10000] flex items-center justify-center px-3">

@@ -80,7 +80,9 @@ export default function PatientQueueTable({
   search = "",
   onRefresh,
   onNotify,
-  onConfirm
+  onConfirm,
+  onViewTicket,
+  ticketLoadingId = null
 }) {
   const pendingCallsRef = useRef(new Set());
   const [callingDoctors, setCallingDoctors] = useState(() => new Set());
@@ -109,7 +111,7 @@ export default function PatientQueueTable({
       const source =
         statusFilter === "active"
           ? doctorStates[doctor.name].activeRows
-          : (queueRows ?? []).filter((row) => row.status === statusFilter && belongsToDoctor(row, doctor.name));
+          : (queueRows ?? []).filter((row) => (statusFilter === "all" || row.status === statusFilter) && belongsToDoctor(row, doctor.name));
 
       for (const row of source) {
         const existing = byId.get(row.id);
@@ -433,7 +435,22 @@ export default function PatientQueueTable({
                     </span>
                   </td>
                   <td className="px-4 py-4 text-right">
-                    <div className="flex justify-end gap-2 flex-wrap">{renderActions(row, doctorName)}</div>
+                    <div className="flex justify-end gap-2 flex-wrap">
+                      {onViewTicket ? (
+                        <button
+                          type="button"
+                          onClick={() => onViewTicket(row)}
+                          disabled={ticketLoadingId != null}
+                          aria-busy={String(ticketLoadingId) === String(row.id)}
+                          aria-label={`View ticket ${row.queue_number}`}
+                          className="px-3 py-1.5 border brand-border brand-text rounded-lg text-xs font-bold brand-hover-subtle transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed"
+                        >
+                          <i className="fas fa-ticket-alt me-1" aria-hidden="true" />
+                          {String(ticketLoadingId) === String(row.id) ? "Opening ticket..." : "View Ticket"}
+                        </button>
+                      ) : null}
+                      {renderActions(row, doctorName)}
+                    </div>
                   </td>
                 </tr>
               ))

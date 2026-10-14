@@ -84,6 +84,7 @@ function fakeSupabase(database, now, localFallback) {
           if (existing) {
             if (!this.upsertOptions.ignoreDuplicates) {
               Object.assign(existing, payload);
+              if (this.table === "patients") existing.visit_state_revision = crypto.randomUUID();
               rows.push(existing);
             }
             continue;
@@ -91,13 +92,19 @@ function fakeSupabase(database, now, localFallback) {
           const defaults = this.table === "counters"
             ? { service_types: [], is_online: true, current_patient_id: null }
             : { called_at: null, completed_at: null, consultation_started_at: null, counter_id: null, reason: null };
+          if (this.table === "patients") defaults.visit_state_revision = crypto.randomUUID();
           const inserted = { id: nextId++, created_at: new Date(now()).toISOString(), ...defaults, ...payload };
           table.push(inserted);
           rows.push(inserted);
         }
       } else {
         rows = table.filter((row) => this.filters.every((filter) => filter(row)));
-        if (this.action === "update") rows.forEach((row) => Object.assign(row, this.payload));
+        if (this.action === "update") rows.forEach((row) => {
+          Object.assign(row, this.payload);
+          // Model the database trigger, including updates that restore every
+          // status/timestamp field to its previous value within one millisecond.
+          if (this.table === "patients") row.visit_state_revision = crypto.randomUUID();
+        });
       }
       for (let i = this.orders.length - 1; i >= 0; i -= 1) {
         const { key, ascending } = this.orders[i];
@@ -133,6 +140,52 @@ function fakeSupabase(database, now, localFallback) {
       const patient = patients.find((row) => row.id === args.p_patient_id);
       const counter = counters.find((row) => row.id_num === args.p_doctor_name);
       const user = database.users.find((row) => row.id_num === args.p_user_id_num);
+      const timestamp = new Date(database.clock ? database.clock.now : now()).toISOString();
+      if (name === "recover_patient_visit") {
+        if (!user || !["admin", "superadmin"].includes(user.role)) {
+          return { data: null, error: { code: "42501", message: "An authenticated queue operator is required" } };
+        }
+        if (!patient) return { data: null, error: { code: "P0002", message: "Patient not found" } };
+        if (!["requeue", "undo"].includes(args.p_action)) {
+          return { data: null, error: { code: "P0001", message: "Unsupported patient recovery action" } };
+        }
+        const equalTimestamp = (actual, expected) => actual == null && expected == null
+          || actual != null && expected != null && timestampMicroseconds(actual) !== null
+            && timestampMicroseconds(actual) === timestampMicroseconds(expected);
+        if (!args.p_expected_revision || patient.visit_state_revision !== args.p_expected_revision
+          || patient.status !== args.p_expected_status
+          || !equalTimestamp(patient.created_at, args.p_expected_created_at)
+          || !equalTimestamp(patient.called_at, args.p_expected_called_at)
+          || !equalTimestamp(patient.consultation_started_at, args.p_expected_started_at)
+          || !equalTimestamp(patient.completed_at, args.p_expected_completed_at)
+          || (patient.counter_id ?? null) !== args.p_expected_counter_id) {
+          return { data: null, error: { code: "40001", message: "Patient visit state changed; refresh before recovery" } };
+        }
+        if (patient.status === "completed" && patient.consultation_started_at) {
+          return { data: null, error: { code: "P0001", message: "Completed consultation history must be preserved. Register a new visit instead." } };
+        }
+        if (args.p_action === "undo" && !["completed", "cancelled", "no-show"].includes(patient.status)) {
+          return { data: null, error: { code: "P0001", message: "Only completed, cancelled, or no-show patients can be undone" } };
+        }
+        patient.status = "waiting";
+        patient.completed_at = null;
+        patient.consultation_started_at = null;
+        if (args.p_action === "requeue") {
+          patient.created_at = timestamp;
+          patient.called_at = null;
+          patient.counter_id = null;
+          patient.reason = args.p_reason ?? null;
+        } else {
+          const available = counters.filter((row) => ["Doctor 1", "Doctor 2", "Doctor 3"].includes(row.id_num))
+            .sort((a, b) => a.id - b.id).find((row) => row.is_online && row.current_patient_id == null);
+          if (available) available.current_patient_id = patient.id;
+        }
+        patient.visit_state_revision = crypto.randomUUID();
+        if (database.beforeRpcCommit) await database.beforeRpcCommit({ name, args, patients, counters });
+        database.patients.splice(0, database.patients.length, ...patients);
+        database.counters.splice(0, database.counters.length, ...counters);
+        return { data: database.rpcReturnsArray ? [clone(patient)] : clone(patient), error: null };
+      }
       if (!user || user.role !== "admin" || user.doctor_name !== args.p_doctor_name) {
         return { data: null, error: { code: "42501", message: "Authenticated doctor identity no longer matches" } };
       }
@@ -146,7 +199,6 @@ function fakeSupabase(database, now, localFallback) {
       if (patient.status !== "serving" || !patient.called_at || patient.completed_at) {
         return { data: null, error: { code: "P0001", message: "Only an active serving patient can receive consultation actions" } };
       }
-      const timestamp = new Date(database.clock ? database.clock.now : now()).toISOString();
       if (name === "start_patient_consultation") {
         if (patient.consultation_started_at) return { data: null, error: { code: "P0001", message: "Consultation has already started" } };
         if (!args.p_accepted_at || !Number.isFinite(Date.parse(args.p_accepted_at))) {
@@ -174,6 +226,7 @@ function fakeSupabase(database, now, localFallback) {
       } else {
         throw new Error(`Unexpected RPC: ${name}`);
       }
+      patient.visit_state_revision = crypto.randomUUID();
       if (database.beforeRpcCommit) await database.beforeRpcCommit({ name, args, patients, counters });
       database.patients.splice(0, database.patients.length, ...patients);
       database.counters.splice(0, database.counters.length, ...counters);
@@ -235,6 +288,7 @@ function createHarness(options = {}) {
     "../lib/supabase": supabase,
     "../config/env": options.localFallback ? {} : { supabaseUrl: "https://isolated-test.invalid", supabaseServiceRoleKey: "isolated-test-key" },
     bcryptjs: {},
+    "node:crypto": crypto,
     "./notificationService": {
       sendQueueCreatedNotification: (...args) => notifications.push({ type: "created", args }),
       sendQueueCalledNotification: async (...args) => notifications.push({ type: "called", args })

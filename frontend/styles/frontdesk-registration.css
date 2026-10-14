@@ -1,0 +1,61 @@
+.frontdesk-workspace-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem;
+  width: 100%;
+  margin-bottom: 1rem;
+  padding: .5rem;
+  border: 1px solid var(--brand-border);
+  background: var(--brand-surface);
+  border-radius: .85rem;
+}
+.frontdesk-workspace-nav a {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: .5rem;
+  padding: .65rem 1rem;
+  color: var(--brand-forest);
+  text-decoration: none;
+  font-size: .9rem;
+  font-weight: 600;
+  border-radius: .55rem;
+}
+.frontdesk-workspace-nav a:hover { background: var(--brand-subtle); }
+.frontdesk-workspace-nav a[aria-current="page"] { background: var(--brand-primary); color: white; }
+.frontdesk-workspace-nav a:focus-visible,
+.registration-complete a:focus-visible,
+.registration-complete button:focus-visible {
+  outline: 3px solid var(--brand-primary);
+  outline-offset: 3px;
+}
+.frontdesk-shell > .frontdesk-workspace-nav { max-width: 1400px; }
+.registration-complete { text-align: left; }
+.registration-success-summary { display: flex; gap: .85rem; align-items: flex-start; margin-bottom: 1.4rem; }
+.registration-success-summary > i { color: var(--brand-primary); font-size: 1.8rem; }
+.registration-success-summary h2 { font-size: 1.35rem; font-weight: 700; margin: 0 0 .3rem; color: var(--brand-forest); }
+.registration-success-summary p { margin: 0; color: var(--brand-muted); }
+.registration-ticket-layout { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(250px, 1fr); gap: 1.5rem; align-items: start; }
+.registration-ticket-preview, .registration-delivery { min-width: 0; }
+.registration-delivery { padding: 1.25rem; border: 1px solid var(--brand-border); border-radius: .85rem; background: var(--brand-background); }
+.registration-delivery h3, .registration-navigation h3, .registration-review h3 { font-size: 1rem; font-weight: 700; color: var(--brand-forest); margin: 0 0 .5rem; }
+.registration-delivery p, .registration-snapshot { font-size: .87rem; color: var(--brand-muted); }
+.registration-snapshot { margin: .9rem 0 0; }
+.registration-snapshot strong { color: var(--brand-forest); }
+.registration-navigation { margin-top: 1.4rem; padding-top: 1.2rem; border-top: 1px solid var(--brand-border); }
+.registration-navigation-actions { display: flex; gap: .65rem; flex-wrap: wrap; margin-top: .7rem; }
+.registration-navigation-actions .btn { padding: .7rem 1rem !important; font-weight: 600 !important; }
+.registration-review { padding: 1rem; background: var(--brand-subtle); border: 1px solid var(--brand-border); border-radius: .75rem; margin-top: .7rem; }
+.registration-review p { font-size: .85rem; margin: 0; color: var(--brand-text); }
+.registration-review .registration-review-note { color: var(--brand-muted); margin-top: .3rem; }
+.frontdesk-fit-card .registration-inputs:disabled { opacity: .75; }
+@media (max-width: 800px) {
+  .registration-ticket-layout { grid-template-columns: minmax(0, 1fr); gap: 1rem; }
+}
+@media (max-width: 540px) {
+  .frontdesk-workspace-nav a { flex: 1 1 100%; justify-content: flex-start; }
+  .registration-navigation-actions { flex-direction: column; }
+  .registration-navigation-actions .btn { width: 100%; }
+  .registration-success-summary h2 { font-size: 1.15rem; }
+  .registration-delivery { padding: 1rem; }
+}

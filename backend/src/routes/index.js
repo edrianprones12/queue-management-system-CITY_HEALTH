@@ -386,7 +386,7 @@ router.post("/queue/recall", authenticateToken, async (req, res) => {
 router.post("/queue/requeue", authenticateToken, async (req, res) => {
   try {
     const { patient_id, reason } = req.body;
-    await requeuePatient(Number(patient_id), reason);
+    await requeuePatient(Number(patient_id), reason, req.user);
     resetAcceptState(patient_id);
     res.json({ success: true, message: "Patient re-queued successfully" });
   } catch (error) {
@@ -397,7 +397,7 @@ router.post("/queue/requeue", authenticateToken, async (req, res) => {
 router.post("/queue/undo", authenticateToken, async (req, res) => {
   try {
     const { patient_id } = req.body;
-    await undoPatientAction(Number(patient_id));
+    await undoPatientAction(Number(patient_id), req.user);
     resetAcceptState(patient_id);
     res.json({ success: true, message: "Action undone successfully" });
   } catch (error) {
