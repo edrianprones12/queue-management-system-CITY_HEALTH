@@ -1,6 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import SiteFrame from "../components/SiteFrame";
+import FrontdeskNavigation from "../components/FrontdeskNavigation";
+import DigitalQueuePass from "../components/DigitalQueuePass";
+import QueueTicketActions from "../components/QueueTicketActions";
+import QueueTicketDialog from "../components/QueueTicketDialog";
 import { request } from "../lib/api";
+import { createQueueTicket, getPatientsAheadSnapshot } from "../lib/queueTicket";
 import { useAuth } from "../context/AuthContext";
 import { frontdeskSidebarLinks } from "../lib/frontdeskNav";
 
@@ -110,62 +116,95 @@ export default function FillUpFormPage() {
   const [message, setMessage] = useState({ type: "", text: "", queue: "", priorityScore: 0, serviceType: "" });
   const [isLoading, setIsLoading] = useState(false);
   const [isSuccess, setIsSuccess] = useState(false);
-  const [waitingCount, setWaitingCount] = useState(0);
+  const [waitingCount, setWaitingCount] = useState(null);
+  const [ticket, setTicket] = useState(null);
+  const [dialogTicket, setDialogTicket] = useState(null);
+  const [ticketLoading, setTicketLoading] = useState(false);
+  const [ticketError, setTicketError] = useState("");
+  const submittingRef = useRef(false);
+  const registrationSavedRef = useRef(false);
+  const ticketLoadingRef = useRef(false);
+  const residencyRequestRef = useRef(0);
+  const focusFormRef = useRef(false);
+  const successHeadingRef = useRef(null);
+  const ticketGenerationRef = useRef(0);
+  const savedPatientIdRef = useRef(null);
+  const canIssueTicket = isFrontdesk || user?.role === "superadmin";
+  const canIssueTicketRef = useRef(canIssueTicket);
+  canIssueTicketRef.current = canIssueTicket;
   const [residencySuggestions, setResidencySuggestions] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
+  const [currentDate, setCurrentDate] = useState("");
 
   useEffect(() => {
-    if (!message.queue) {
-      return undefined;
+    // Keep server and initial browser markup identical, including across midnight.
+    const updateDate = () => setCurrentDate(new Date().toLocaleDateString("en-US", {
+      weekday: "long", year: "numeric", month: "long", day: "numeric", timeZone: "Asia/Manila"
+    }));
+    updateDate();
+    const dateTimer = setInterval(updateDate, 60000);
+    return () => clearInterval(dateTimer);
+  }, []);
+
+  useEffect(() => {
+    if (isSuccess) successHeadingRef.current?.focus();
+    else if (focusFormRef.current) {
+      focusFormRef.current = false;
+      document.getElementById("patient-first-name")?.focus();
     }
+  }, [isSuccess]);
 
-    const redirectTimer = setTimeout(() => {
-      // We don't necessarily want to redirect immediately if we show a success view
-      // window.location.href = `/queue-display?queue=${encodeURIComponent(message.queue)}`;
-    }, 5000);
+  useEffect(() => {
+    if (!canIssueTicket) {
+      ticketGenerationRef.current += 1;
+      savedPatientIdRef.current = null;
+      setTicket(null);
+      setDialogTicket(null);
+      setWaitingCount(null);
+    }
+  }, [canIssueTicket]);
 
-    return () => clearTimeout(redirectTimer);
-  }, [message]);
+  function updateCurrentTicket(updated) {
+    if (canIssueTicketRef.current && savedPatientIdRef.current != null && String(updated?.patientId) === String(savedPatientIdRef.current)) {
+      setTicket(updated);
+    }
+  }
 
-  const handlePrintTicket = () => {
-    const printWindow = window.open('', '_blank', 'width=300,height=600');
-    const serviceLabel = serviceOptions.find(s => s.value === message.serviceType)?.label || message.serviceType;
-    
-    const content = `
-      <html>
-        <head>
-          <title>Queue Ticket</title>
-          <style>
-            body { font-family: 'Courier New', Courier, monospace; width: 280px; margin: 0 auto; text-align: center; padding: 20px; }
-            .header { font-weight: bold; font-size: 16px; margin-bottom: 5px; }
-            .subheader { font-size: 12px; margin-bottom: 20px; border-bottom: 1px dashed #000; padding-bottom: 10px; }
-            .queue-num { font-size: 48px; font-weight: bold; margin: 20px 0; }
-            .info { font-size: 14px; margin-bottom: 10px; text-align: left; }
-            .footer { font-size: 10px; margin-top: 30px; border-top: 1px dashed #000; padding-top: 10px; }
-          </style>
-        </head>
-        <body>
-          <div class="header">CHO & Family Planning Center</div>
-          <div class="subheader">Cabadbaran City</div>
-          <div class="info">Service: ${serviceLabel}</div>
-          <div class="queue-num">${message.queue}</div>
-          <div class="info">Priority Score: ${message.priorityScore}</div>
-          <div class="info">Date: ${new Date().toLocaleDateString()}</div>
-          <div class="info">Time: ${new Date().toLocaleTimeString()}</div>
-          <div class="footer">
-            Please wait for your number to be called.<br>
-            Thank you for your patience.
-          </div>
-          <script>
-            window.onload = function() { window.print(); window.close(); }
-          </script>
-        </body>
-      </html>
-    `;
-    
-    printWindow.document.write(content);
-    printWindow.document.close();
-  };
+  function viewCurrentTicket(updated) {
+    if (canIssueTicketRef.current && savedPatientIdRef.current != null && String(updated?.patientId) === String(savedPatientIdRef.current)) {
+      setDialogTicket(updated);
+    }
+  }
+
+  async function loadSavedTicket(queueNumber, captureSnapshot = false) {
+    if (ticketLoadingRef.current) return;
+    if (!canIssueTicketRef.current) {
+      setTicketError("Ticket retrieval is available to authorized Frontdesk staff.");
+      return;
+    }
+    const generation = ticketGenerationRef.current;
+    ticketLoadingRef.current = true;
+    setTicketLoading(true);
+    setTicketError("");
+    try {
+      const data = await request("/queue");
+      if (generation !== ticketGenerationRef.current || !canIssueTicketRef.current) return;
+      if (data.error) throw new Error(data.error);
+      // The registration response contains the saved queue number. Resolve its
+      // unique record before showing a pass; never reconstruct one from form input.
+      const matches = (data.patients || []).filter((row) => row.queue_number === queueNumber);
+      if (matches.length !== 1) throw new Error("The saved ticket could not be found in today's queue. Check Patient Management; do not register this patient again.");
+      const savedPatient = matches[0];
+      savedPatientIdRef.current = savedPatient.id;
+      setTicket(createQueueTicket(savedPatient));
+      if (captureSnapshot) setWaitingCount(getPatientsAheadSnapshot(data.patients, savedPatient));
+    } catch (error) {
+      if (generation === ticketGenerationRef.current) setTicketError(error.message || "Unable to load the saved ticket. Please retry.");
+    } finally {
+      ticketLoadingRef.current = false;
+      setTicketLoading(false);
+    }
+  }
 
   const handleBirthdateChange = (e) => {
     const birthdate = e.target.value;
@@ -196,6 +235,7 @@ export default function FillUpFormPage() {
   };
 
   const handleResidencySearch = async (query) => {
+    const requestVersion = ++residencyRequestRef.current;
     setForm(prev => ({ ...prev, residency: query }));
     if (query.length < 3) {
       setResidencySuggestions([]);
@@ -205,6 +245,7 @@ export default function FillUpFormPage() {
 
     try {
       const data = await request(`/geocode?q=${encodeURIComponent(query)}`);
+      if (requestVersion !== residencyRequestRef.current) return;
       if (Array.isArray(data)) {
         setResidencySuggestions(data);
         setShowSuggestions(data.length > 0);
@@ -213,6 +254,7 @@ export default function FillUpFormPage() {
         setShowSuggestions(false);
       }
     } catch (error) {
+      if (requestVersion !== residencyRequestRef.current) return;
       console.error("Residency search failed:", error);
       setResidencySuggestions([]);
       setShowSuggestions(false);
@@ -220,12 +262,14 @@ export default function FillUpFormPage() {
   };
 
   const selectResidency = (item) => {
+    residencyRequestRef.current += 1;
     setForm({ ...form, residency: item.display_name });
     setShowSuggestions(false);
   };
 
   async function handleSubmit(event) {
     event.preventDefault();
+    if (submittingRef.current || registrationSavedRef.current || isSuccess) return;
 
     const nameError = validateName(form);
     if (nameError) {
@@ -237,6 +281,9 @@ export default function FillUpFormPage() {
       return;
     }
 
+    submittingRef.current = true;
+    ticketGenerationRef.current += 1;
+    savedPatientIdRef.current = null;
     setIsLoading(true);
     setMessage({ type: "", text: "", queue: "" });
 
@@ -270,16 +317,7 @@ export default function FillUpFormPage() {
         return;
       }
 
-      // Fetch current stats to show waiting position
-      try {
-        const statsRes = await request("/stats");
-        if (statsRes.success) {
-          setWaitingCount(statsRes.data.waiting);
-        }
-      } catch (err) {
-        console.error("Failed to fetch stats", err);
-      }
-
+      registrationSavedRef.current = true;
       setMessage({
         type: "success",
         text: "Your queue number has been generated successfully!",
@@ -290,9 +328,16 @@ export default function FillUpFormPage() {
       });
       setIsSuccess(true);
       setForm(emptyForm);
+      residencyRequestRef.current += 1;
+      setResidencySuggestions([]);
+      setShowSuggestions(false);
+      // A retrieval failure must not turn a committed registration into a
+      // submission error, which could cause an accidental duplicate patient.
+      await loadSavedTicket(data.queue_number, true);
     } catch (error) {
       setMessage({ type: "danger", text: error.message, queue: "" });
     } finally {
+      submittingRef.current = false;
       setIsLoading(false);
     }
   }
@@ -310,8 +355,21 @@ export default function FillUpFormPage() {
   };
 
   const resetForm = () => {
+    if (submittingRef.current || ticketLoadingRef.current) return;
     setForm(emptyForm);
     setMessage({ type: "", text: "", queue: "" });
+    setIsSuccess(false);
+    ticketGenerationRef.current += 1;
+    savedPatientIdRef.current = null;
+    focusFormRef.current = true;
+    residencyRequestRef.current += 1;
+    registrationSavedRef.current = false;
+    setTicket(null);
+    setDialogTicket(null);
+    setTicketError("");
+    setWaitingCount(null);
+    setResidencySuggestions([]);
+    setShowSuggestions(false);
   };
 
   return (
@@ -329,12 +387,13 @@ export default function FillUpFormPage() {
     >
       <div className="frontdesk-fullpage-wrapper">
         <div className="frontdesk-shell">
+          <FrontdeskNavigation activePath="/fill-up_form" />
           <div className="frontdesk-fit-card frontdesk-form-card">
             <div className="frontdesk-card-header">
               {!isSuccess ? (
                 <>
                   <h5 className="card-title fw-bold brand-text" style={{fontSize: '1rem'}}><i className="bi bi-person-plus-fill text-csu-primary"></i> Join the Queue</h5>
-                  <p className="brand-text-muted" style={{fontSize: '0.78rem'}}><i className="bi bi-clock-history me-1"></i> {new Date().toLocaleString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</p>
+                  <p className="brand-text-muted" style={{fontSize: '0.78rem'}}><i className="bi bi-clock-history me-1"></i> {currentDate}</p>
                 </>
               ) : (
                 <>
@@ -348,20 +407,21 @@ export default function FillUpFormPage() {
               {!isSuccess ? (
                 <>
                   {message.text ? (
-                    <div className={`alert alert-${message.type} text-center py-2 small`}>{message.text}</div>
+                    <div role="alert" className={`alert alert-${message.type} text-center py-2 small`}>{message.text}</div>
                   ) : null}
 
                   <form onSubmit={handleSubmit}>
                     <div className="frontdesk-demographics-panel brand-bg-subtle p-3 p-md-4 rounded-3 border brand-border mb-3">
-                      <div className="frontdesk-section-title">
+                      <h2 className="frontdesk-section-title">
                         <i className="bi bi-person-lines-fill"></i>
-                        Patient Demographics
-                      </div>
+                        Patient Information
+                      </h2>
                       <div className="frontdesk-form-grid">
                       <div className="grid-full row g-2 mb-3">
                         <div className="col-12 col-md-5">
-                          <label className="brand-text form-label fw-semibold small">First Name <span className="text-danger">*</span></label>
+                          <label htmlFor="patient-first-name" className="brand-text form-label fw-semibold small">First Name <span className="text-danger">*</span></label>
                           <input
+                            id="patient-first-name"
                             type="text"
                             className="brand-input form-control form-control-sm"
                             placeholder="e.g. Juan"
@@ -373,8 +433,9 @@ export default function FillUpFormPage() {
                           />
                         </div>
                         <div className="col-12 col-md-2">
-                          <label className="brand-text form-label fw-semibold small">Middle Initial (Optional)</label>
+                          <label htmlFor="patient-middle-initial" className="brand-text form-label fw-semibold small">Middle Initial (Optional)</label>
                           <input
+                            id="patient-middle-initial"
                             type="text"
                             className="brand-input form-control form-control-sm"
                             placeholder="e.g. D"
@@ -387,8 +448,9 @@ export default function FillUpFormPage() {
                           />
                         </div>
                         <div className="col-12 col-md-5">
-                          <label className="brand-text form-label fw-semibold small">Last Name <span className="text-danger">*</span></label>
+                          <label htmlFor="patient-last-name" className="brand-text form-label fw-semibold small">Last Name <span className="text-danger">*</span></label>
                           <input
+                            id="patient-last-name"
                             type="text"
                             className="brand-input form-control form-control-sm"
                             placeholder="e.g. Dela Cruz"
@@ -402,10 +464,11 @@ export default function FillUpFormPage() {
                       </div>
 
                       <div className="mb-3">
-                        <label className="brand-text form-label fw-semibold small">Mobile Number (Optional)</label>
+                        <label htmlFor="patient-mobile" className="brand-text form-label fw-semibold small">Mobile Number (Optional)</label>
                         <div className="input-group input-group-sm">
                           <span className="input-group-text brand-border bg-white border-end-0">+63</span>
                           <input
+                            id="patient-mobile"
                             type="text"
                             className="brand-input form-control border-start-0 ps-1"
                             placeholder="9123456789"
@@ -418,8 +481,9 @@ export default function FillUpFormPage() {
                       </div>
 
                       <div className="mb-3">
-                        <label className="brand-text form-label fw-semibold small">PhilHealth / YAKAP ID (Optional)</label>
+                        <label htmlFor="patient-philhealth" className="brand-text form-label fw-semibold small">PhilHealth / YAKAP ID (Optional)</label>
                         <input
+                          id="patient-philhealth"
                           type="text"
                           className="brand-input form-control form-control-sm"
                           placeholder="PhilHealth or YAKAP ID No."
@@ -430,8 +494,9 @@ export default function FillUpFormPage() {
                       </div>
 
                       <div className="mb-3">
-                        <label className="brand-text form-label fw-semibold small">Sex <span className="text-danger">*</span></label>
+                        <label htmlFor="patient-sex" className="brand-text form-label fw-semibold small">Sex <span className="text-danger">*</span></label>
                         <select
+                          id="patient-sex"
                           className="brand-input form-select form-select-sm"
                           value={form.sex}
                           onChange={(e) => setForm({ ...form, sex: e.target.value })}
@@ -445,8 +510,9 @@ export default function FillUpFormPage() {
                       </div>
 
                       <div className="mb-3">
-                        <label className="brand-text form-label fw-semibold small">Birthdate <span className="text-danger">*</span></label>
+                        <label htmlFor="patient-birthdate" className="brand-text form-label fw-semibold small">Birthdate <span className="text-danger">*</span></label>
                         <input
+                          id="patient-birthdate"
                           type="date"
                           className="brand-input form-control form-control-sm"
                           value={form.birthdate}
@@ -457,12 +523,13 @@ export default function FillUpFormPage() {
                       </div>
 
                       <div className="frontdesk-residency mb-3 position-relative">
-                        <label className="brand-text form-label fw-semibold small">Residency / Complete Address <span className="text-danger">*</span></label>
+                        <label htmlFor="patient-residency" className="brand-text form-label fw-semibold small">Residency / Complete Address <span className="text-danger">*</span></label>
                         <div className="input-group input-group-sm">
                           <span className="input-group-text brand-border bg-white">
                             <i className="bi bi-geo-alt-fill text-danger" />
                           </span>
                           <input
+                            id="patient-residency"
                             type="text"
                             className="brand-input form-control"
                             placeholder="Search and select barangay / city residency..."
@@ -478,15 +545,17 @@ export default function FillUpFormPage() {
                         {showSuggestions && residencySuggestions.length > 0 && (
                           <div className="residency-suggestions position-absolute w-100 mt-1 bg-white border brand-border rounded shadow-sm overflow-hidden" style={{ zIndex: 1000 }}>
                             {residencySuggestions.map((item, index) => (
-                              <div 
+                              <button
+                                type="button"
                                 key={index}
-                                className="px-3 py-2 small brand-hover-subtle cursor-pointer border-bottom brand-border text-truncate"
+                                className="w-100 text-start bg-white px-3 py-2 small brand-hover-subtle border-0 border-bottom brand-border text-truncate"
                                 onClick={() => selectResidency(item)}
+                                disabled={isLoading}
                                 style={{ cursor: 'pointer' }}
                               >
                                 <i className="bi bi-geo-alt me-2 brand-text-muted" />
                                 {item.display_name}
-                              </div>
+                              </button>
                             ))}
                           </div>
                         )}
@@ -495,14 +564,12 @@ export default function FillUpFormPage() {
                     </div>
 
                     <div className="mb-3">
-                      <div className="frontdesk-section-title">
-                        <i className="bi bi-hospital-fill"></i>
-                        Service & Priority
-                      </div>
                       <div className="frontdesk-wide-split">
                         <div className="mb-3">
-                          <label className="brand-text form-label fw-semibold small">Type of Service <span className="text-danger">*</span></label>
+                          <h2 className="frontdesk-section-title"><i className="bi bi-hospital-fill" aria-hidden="true" /> Service Selection</h2>
+                          <label htmlFor="patient-service" className="brand-text form-label fw-semibold small">Type of Service <span className="text-danger">*</span></label>
                           <select
+                            id="patient-service"
                             className="brand-input form-select form-select-sm"
                             value={form.serviceType}
                             onChange={(e) => setForm({ ...form, serviceType: e.target.value })}
@@ -522,6 +589,7 @@ export default function FillUpFormPage() {
                         </div>
 
                         <div className="mb-3">
+                          <h2 className="frontdesk-section-title"><i className="bi bi-star" aria-hidden="true" /> Priority Classification</h2>
                           <label className="brand-text form-label fw-semibold small">Vulnerability <span className="brand-text-muted fw-normal">(auto-computed)</span></label>
                           <div className="frontdesk-vulnerability bg-white p-3 rounded-3 border brand-border">
                             {vulnerabilityOptions.map((opt) => (
@@ -551,13 +619,15 @@ export default function FillUpFormPage() {
                       </div>
                     </div>
 
+                    <section className="registration-review" aria-labelledby="registration-review-title">
+                      <h3 id="registration-review-title">Review and Submit</h3>
+                      <p>{buildFullName(form) || "Enter the patient information above."} · {serviceOptions.find((option) => option.value === form.serviceType)?.label || "Select a service"}{form.serviceType ? ` · ${getDoctorForService(form.serviceType)}` : ""}</p>
+                      <p className="registration-review-note">Check the patient details and classification before generating one queue number.</p>
+                    </section>
                     <div className="d-flex gap-2 mt-3 mt-md-3 justify-content-end">
                       <button 
                         type="button"
-                        onClick={() => {
-                          setForm(emptyForm);
-                          setMessage({ text: '', type: 'success' });
-                        }}
+                        onClick={resetForm}
                         className="btn btn-outline-secondary py-1.5 rounded fw-semibold px-3"
                         disabled={isLoading}
                       >
@@ -585,61 +655,53 @@ export default function FillUpFormPage() {
                   </form>
                 </>
               ) : (
-                <div className="frontdesk-success text-center h-100">
-                  <div className="frontdesk-success-layout">
-                    <div className="mb-3 mb-md-0">
-                      <div className="display-1 text-success mb-2">
-                        <i className="bi bi-check-circle-fill"></i>
-                      </div>
-                      <h3 className="fw-bold mb-1 brand-text">Registration Successful!</h3>
-                      <p className="brand-text-muted mb-0">{message.text}</p>
-                    </div>
-
-                    <div className="brand-bg-subtle p-4 p-md-5 rounded-4 border border-dashed border-success mb-3">
-                      <p className="text-uppercase small fw-bold brand-text-muted mb-2">Your Queue Number</p>
-                      <div className="display-2 fw-bold text-csu-primary tracking-tighter mb-3">{message.queue}</div>
-                      <div className="d-flex align-items-center justify-content-center gap-3 flex-wrap mb-2">
-                        <span className="badge brand-accent-badge fs-6 px-4 py-2">
-                          <i className="bi bi-star-fill me-1"></i>
-                          Priority Score: {message.priorityScore}
-                        </span>
-                        {waitingCount > 0 && (
-                          <span className="badge brand-bg-subtle brand-text border px-3 py-2 small">
-                            <i className="bi bi-people-fill me-1"></i>
-                            {waitingCount - 1} patients ahead
-                          </span>
-                        )}
-                      </div>
-                      <p className="brand-text-muted small mb-0 mt-2">
-                        <i className="bi bi-hospital me-1"></i>
-                        {message.doctorName || 'Assigned Doctor'}
-                      </p>
+                <div className="registration-complete">
+                  <div className="registration-success-summary" role="status">
+                    <i className="bi bi-check-circle-fill" aria-hidden="true" />
+                    <div>
+                      <h2 ref={successHeadingRef} tabIndex={-1}>Registration Successful</h2>
+                      <p>The patient is saved. Deliver their ticket, then continue to the next patient.</p>
+                      {ticket && canIssueTicket ? <p>{ticket.serviceLabel} · {ticket.doctorName}</p> : <p>Saved queue number: <strong>{message.queue}</strong></p>}
                     </div>
                   </div>
 
-                  <div className="d-grid gap-2 gap-md-3 d-md-flex justify-content-md-center mt-3">
-                    <button 
-                      onClick={handlePrintTicket}
-                      className="btn btn-csu-primary py-2 py-md-3 fw-bold d-flex align-items-center justify-content-center gap-2 px-4 px-md-5"
-                    >
-                      <i className="bi bi-printer-fill fs-5"></i>
-                      Print Thermal Ticket
-                    </button>
-                    <button 
-                      onClick={() => window.location.href = `/queue-display?queue=${encodeURIComponent(message.queue)}`}
-                      className="btn btn-csu-primary py-2 py-md-3 fw-bold px-4 px-md-5"
-                    >
-                      <i className="bi bi-display me-1"></i>
-                      View Live Queue
-                    </button>
-                    <button 
-                      onClick={() => setIsSuccess(false)}
-                      className="btn btn-outline-secondary py-2 py-md-3 fw-semibold px-4 px-md-5"
-                    >
-                      <i className="bi bi-person-plus me-1"></i>
-                      Register Another Patient
-                    </button>
+                  <div className="registration-ticket-layout">
+                    <section className="registration-ticket-preview" aria-label="Queue ticket preview">
+                      {ticket && canIssueTicket ? <DigitalQueuePass ticket={ticket} /> : (
+                        <div className="registration-delivery" aria-live="polite">
+                          <p>{ticketLoading ? "Loading the saved queue ticket…" : "Registration is complete. Load the existing ticket to view or print it."}</p>
+                          <button type="button" className="btn btn-csu-primary" disabled={ticketLoading || !canIssueTicket} onClick={() => loadSavedTicket(message.queue)}>
+                            {ticketLoading ? "Loading…" : "Retry Loading Ticket"}
+                          </button>
+                        </div>
+                      )}
+                      {ticketError ? <p role="alert" className="text-danger mt-2">{ticketError}</p> : null}
+                      {waitingCount !== null && canIssueTicket ? (
+                        <p className="registration-snapshot"><strong>{waitingCount} waiting {waitingCount === 1 ? "patient" : "patients"} ahead</strong> in {ticket?.doctorName}'s queue at registration.<br />Registration snapshot; priority arrivals and queue activity can change the order. Photos and downloaded tickets do not update.</p>
+                      ) : null}
+                    </section>
+
+                    <section className="registration-delivery" aria-labelledby="ticket-delivery-title">
+                      <h3 id="ticket-delivery-title">Ticket Delivery</h3>
+                      <p>Choose a digital pass to photograph or download, or print a thermal ticket. Each uses the same saved queue number.</p>
+                      {ticket && canIssueTicket ? <QueueTicketActions ticket={ticket} onView={viewCurrentTicket} onTicketUpdate={updateCurrentTicket} /> : <p>{ticketLoading ? "Preparing ticket actions…" : "Ticket delivery is available to authorized Frontdesk staff."}</p>}
+                    </section>
                   </div>
+
+                  <section className="registration-navigation" aria-labelledby="registration-navigation-title">
+                    <h3 id="registration-navigation-title">Continue at Frontdesk</h3>
+                    <div className="registration-navigation-actions">
+                      <button type="button" onClick={resetForm} disabled={isLoading || ticketLoading} className="btn btn-csu-primary">
+                        <i className="bi bi-person-plus me-1" aria-hidden="true" /> Register Another Patient
+                      </button>
+                      <Link href="/patient-management" className="btn btn-outline-secondary">
+                        <i className="bi bi-people me-1" aria-hidden="true" /> Patient Management
+                      </Link>
+                      <Link href="/queue-display" className="btn btn-outline-secondary">
+                        <i className="bi bi-display me-1" aria-hidden="true" /> View Live Queue
+                      </Link>
+                    </div>
+                  </section>
                 </div>
               )}
             </div>
@@ -647,12 +709,12 @@ export default function FillUpFormPage() {
 
           {!isSuccess && (
             <p className="frontdesk-disclaimer brand-text-muted small">
-              By joining the queue, you agree to receive SMS notifications <br className="d-none d-sm-block" />
-              regarding your status. Standard rates may apply.
+              Review the patient details before submitting. A lost ticket can be retrieved through Patient Management.
             </p>
           )}
         </div>
       </div>
+      {dialogTicket && canIssueTicket ? <QueueTicketDialog ticket={dialogTicket} onClose={() => setDialogTicket(null)} onTicketUpdate={updateCurrentTicket} /> : null}
     </SiteFrame>
   );
 }

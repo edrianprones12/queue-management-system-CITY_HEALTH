@@ -11,6 +11,12 @@ export function frontdeskSidebarLinks(activePath) {
       icon: "fas fa-hospital-user",
       label: "Patient Management",
       active: activePath === "/patient-management"
+    },
+    {
+      href: "/queue-display",
+      icon: "fas fa-desktop",
+      label: "Live Queue Display",
+      active: activePath === "/queue-display"
     }
   ];
 }
