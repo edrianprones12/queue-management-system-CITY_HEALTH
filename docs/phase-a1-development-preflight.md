@@ -1,5 +1,7 @@
 # Phase A.1 preflight and verification — 13 October 2026
 
+**Historical preflight snapshot.** See the [16 October final development verification report](phase-a1-development-verification-20261016.md) for the subsequent installation, actual API and guided browser results. Phase A.1 remains partially verified; its outstanding tests and Phase B limits are documented there. The observations below describe the earlier preflight state.
+
 **Status: development target confirmed; live access remains unavailable. Live verification is incomplete.** The user confirmed the previous development project, and only the local backend URL was updated to that target. Its backend key is still a placeholder, so no database network request, SQL execution, login, heartbeat, migration or patient mutation was attempted. Target confirmation is not database-modification approval; that approval has not been received. Phase B is not ready for approval from this evidence.
 
 ## 1. Environment identification
